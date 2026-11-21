@@ -59,7 +59,8 @@ fn process(
             .then_with(|| a.time.cmp(&b.time))
             .then_with(|| b.id.cmp(a.id))
     });
-    clicks.dedup_by(|a, b| a.person == b.person && a.time == b.time && a.id == b.id);
+    // Identical clicks leave the latest eligible campaign and its merged
+    // coverage intervals unchanged, so attribution can consume them directly.
 
     let mut users = Users::new(path)?;
     let mut aggregator = Aggregator::new(&products.categories, campaigns.organic, layout);
@@ -119,20 +120,22 @@ fn run(data: &Path, out: &Path) -> Result<(), Error> {
     let click_input = Input::open(&data.join("clicks"))?;
     let identities = People::default();
     let encoder = EventEncoder::new(window.start);
-    let linked_ids = LinkedIds::new(&links, &identities);
-    elapsed("dimensions and linked IDs");
-    let (candidates, clicks) = rayon::join(
+    let (linked_ids, candidates) = rayon::join(
+        || LinkedIds::new(&links, &identities),
         || {
             clean::event_candidates(
                 &event_input,
                 &products,
                 &identities,
-                &linked_ids,
                 window.clone(),
                 &hashes,
                 &encoder,
             )
         },
+    );
+    elapsed("dimensions, linked IDs, and parse events");
+    let (events, clicks) = rayon::join(
+        || candidates.into_events(&linked_ids, &hashes),
         || {
             clean::clicks(
                 &click_input,
@@ -144,11 +147,9 @@ fn run(data: &Path, out: &Path) -> Result<(), Error> {
             )
         },
     );
-    elapsed("parse and route events and clicks");
-    let events = candidates.into_events(&hashes);
     let interned = identities.into_names();
     let decoder = encoder.finish();
-    elapsed("deduplicate events in person partitions");
+    elapsed("deduplicate events and parse clicks");
 
     let user_dir = out.join("user_daily");
     let campaign_dir = out.join("campaign_daily");

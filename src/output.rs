@@ -65,8 +65,11 @@ impl Users {
     pub fn write(&mut self, rows: &[UserDay<'_>], interned: &[&[u8]]) -> Result<(), Error> {
         let mut people = StringBuilder::with_capacity(rows.len(), rows.len() * 9);
         let mut buffer = [0; 9];
-        for row in rows {
-            people.append_value(row.person.name(interned, &mut buffer)?);
+        for group in rows.chunk_by(|a, b| a.person == b.person) {
+            let name = group[0].person.name(interned, &mut buffer)?;
+            for _ in group {
+                people.append_value(name);
+            }
         }
         let columns: Vec<ArrayRef> = vec![
             Arc::new(people.finish()),
