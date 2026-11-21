@@ -183,9 +183,15 @@ struct Block {
 
 pub fn records<'a, const N: usize>(bytes: &'a [u8], mut visit: impl FnMut([&'a [u8]; N])) {
     #[cfg(target_arch = "x86_64")]
-    if std::arch::is_x86_feature_detected!("avx512bw") {
-        // The detection check covers every call for this slice.
-        return records_block(bytes, |block| unsafe { block_avx512(block) }, visit);
+    {
+        static AVX512: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+            std::env::var_os("CSV_SIMD").as_deref() != Some(std::ffi::OsStr::new("avx2"))
+                && std::arch::is_x86_feature_detected!("avx512bw")
+        });
+        if *AVX512 {
+            // The feature check covers the entire scan of this slice.
+            return unsafe { records_avx512(bytes, visit) };
+        }
     }
     #[cfg(any(
         target_arch = "aarch64",
@@ -201,7 +207,8 @@ pub fn records<'a, const N: usize>(bytes: &'a [u8], mut visit: impl FnMut([&'a [
     }
 }
 
-#[inline]
+#[cfg_attr(target_arch = "x86_64", inline(always))]
+#[cfg_attr(not(target_arch = "x86_64"), inline)]
 fn records_block<'a, const N: usize>(
     bytes: &'a [u8],
     classify: impl Fn(&[u8; 64]) -> Block,
@@ -258,15 +265,24 @@ fn records_block<'a, const N: usize>(
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx512bw")]
-unsafe fn block_avx512(bytes: &[u8; 64]) -> Block {
+fn records_avx512<'a, const N: usize>(bytes: &'a [u8], visit: impl FnMut([&'a [u8]; N])) {
     use std::arch::x86_64::*;
-    // The full block is readable and the load allows an unaligned address.
-    let data = unsafe { _mm512_loadu_si512(bytes.as_ptr().cast()) };
-    Block {
-        newlines: _mm512_cmpeq_epi8_mask(data, _mm512_set1_epi8(b'\n' as i8)),
-        commas: _mm512_cmpeq_epi8_mask(data, _mm512_set1_epi8(b',' as i8)),
-        quotes: _mm512_cmpeq_epi8_mask(data, _mm512_set1_epi8(b'"' as i8)),
-    }
+    let newline = _mm512_set1_epi8(b'\n' as i8);
+    let comma = _mm512_set1_epi8(b',' as i8);
+    let quote = _mm512_set1_epi8(b'"' as i8);
+    records_block(
+        bytes,
+        |block| {
+            // The full block is readable and the load allows an unaligned address.
+            let data = unsafe { _mm512_loadu_si512(block.as_ptr().cast()) };
+            Block {
+                newlines: _mm512_cmpeq_epi8_mask(data, newline),
+                commas: _mm512_cmpeq_epi8_mask(data, comma),
+                quotes: _mm512_cmpeq_epi8_mask(data, quote),
+            }
+        },
+        visit,
+    );
 }
 
 #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
