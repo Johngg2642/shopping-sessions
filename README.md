@@ -64,3 +64,12 @@ make build
 time env PROFILE=1 SHOPPING_CPUSET=0-7 scripts/docker_run.sh "$bench/data" "$bench/auto"
 time env PROFILE=1 SHOPPING_CPUSET=0-7 CSV_SIMD=avx2 scripts/docker_run.sh "$bench/data" "$bench/avx2"
 ```
+
+Build the benchmark image on native x86-64 Linux and use the same pinned CPUs and data for each candidate. Pass `--image` twice to alternate between two image tags.
+
+```sh
+docker buildx build --platform linux/amd64 --target benchmark --load -t shopping-sessions:benchmark .
+PROFILE=1 python3 scripts/benchmark_linux.py "$bench/data" --cpuset 0-7
+```
+
+The startup run uses the production binary on header-only inputs and writes empty tables. The parser run decodes event and click CSV rows and timestamps from the full input. The full run writes both tables as usual. Each phase reports Docker create-to-exit wall time and the daemon's start-to-finish time, with one warm-up round excluded from the medians.

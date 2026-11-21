@@ -14,8 +14,22 @@ RUN --mount=type=cache,id=shopping-registry-${TARGETARCH},target=/usr/local/carg
         cargo build --release --locked && cp target/release/shopping-sessions /shopping-sessions; \
     fi
 
-FROM debian:bookworm-slim
+FROM build AS build-probe
+ARG TARGETARCH
+COPY scripts/phase_probe.rs scripts/
+RUN --mount=type=cache,id=shopping-registry-${TARGETARCH},target=/usr/local/cargo/registry \
+    --mount=type=cache,id=shopping-target-${TARGETARCH},target=/build/target \
+    CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS="-C target-cpu=x86-64-v3 -C target-feature=+aes" \
+    cargo build --release --locked --target x86_64-unknown-linux-gnu --features phase-probe --bin phase-probe && \
+    cp target/x86_64-unknown-linux-gnu/release/phase-probe /phase-probe
+
+FROM debian:bookworm-slim AS runtime
 COPY --from=build /shopping-sessions /usr/local/bin/shopping-sessions
 ENV DATA_DIR=/data OUTPUT_DIR=/output SCRATCH_DIR=/scratch HOME=/scratch TMPDIR=/scratch
 USER 1000:1000
 ENTRYPOINT ["/usr/local/bin/shopping-sessions"]
+
+FROM runtime AS benchmark
+COPY --from=build-probe /phase-probe /usr/local/bin/phase-probe
+
+FROM runtime AS scored

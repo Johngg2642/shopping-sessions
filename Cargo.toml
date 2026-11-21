@@ -3,6 +3,15 @@ name = "shopping-sessions"
 version = "0.1.0"
 edition = "2024"
 publish = false
+default-run = "shopping-sessions"
+
+[features]
+phase-probe = []
+
+[[bin]]
+name = "phase-probe"
+path = "scripts/phase_probe.rs"
+required-features = ["phase-probe"]
 
 [dependencies]
 ahash = "0.8"

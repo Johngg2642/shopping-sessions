@@ -1,0 +1,146 @@
+#!/usr/bin/env python3
+"""Time the benchmark image with the scorer's Linux container limits."""
+
+import argparse
+from datetime import datetime
+import json
+import os
+from pathlib import Path
+import platform
+import shutil
+from statistics import median
+import subprocess
+import sys
+import tempfile
+from time import perf_counter
+
+
+PHASES = ("startup", "parse", "full")
+
+
+def docker(*args):
+    return subprocess.check_output(["docker", *args], text=True).strip()
+
+
+def header_only(source, destination):
+    destination.mkdir()
+    shutil.copyfile(source / "manifest.json", destination / "manifest.json")
+    pairs = [(source / name, destination / name) for name in ("products.csv", "campaigns.csv")]
+    for name in ("events", "clicks", "links"):
+        (destination / name).mkdir()
+        pairs.extend((part, destination / name / part.name) for part in (source / name).glob("*.csv"))
+    for original, stripped in pairs:
+        with original.open("rb") as stream:
+            stripped.write_bytes(stream.readline())
+
+
+def sample(image, phase, data, directory, args):
+    for name in ("output", "scratch"):
+        path = directory / name
+        path.mkdir(parents=True)
+        path.chmod(0o777)
+
+    # Keep the limits and mounts in sync with scripts/docker_run.sh.
+    flags = [
+        "--platform", "linux/amd64", "--network", "none", "--read-only",
+        "--tmpfs", "/tmp:rw,size=64m,mode=1777", "--cap-drop", "ALL",
+        "--security-opt", "no-new-privileges", "--pids-limit", "4096",
+        "--cpus", str(args.cpus), "--cpuset-cpus", args.cpuset,
+        "--memory", args.memory, "--memory-swap", args.memory, "--user", "1000:1000",
+        "-v", f"{data}:/data:ro,z", "-v", f"{directory / 'output'}:/output:z",
+        "-v", f"{directory / 'scratch'}:/scratch:z",
+        "-e", f"NCPU={args.cpus}", "-e", f"MEM_GB={args.memory.removesuffix('g')}",
+        "-e", "PROFILE", "-e", "CSV_SIMD",
+    ]
+    if phase == "parse":
+        flags += ["--entrypoint", "/usr/local/bin/phase-probe"]
+
+    started = perf_counter()
+    container = docker("create", *flags, image)
+    try:
+        result = subprocess.run(["docker", "start", "-a", container], capture_output=True, text=True)
+        wall = perf_counter() - started
+        state = json.loads(docker("inspect", "--format", "{{json .State}}", container))
+        if result.returncode or state["ExitCode"]:
+            raise RuntimeError(result.stderr.strip() or state["Error"] or f"{phase} container failed")
+        engine_start = datetime.fromisoformat(state["StartedAt"])
+        engine_finish = datetime.fromisoformat(state["FinishedAt"])
+        return wall, (engine_finish - engine_start).total_seconds(), result.stderr.strip()
+    finally:
+        docker("rm", "-f", container)
+
+
+def clear(directory, image):
+    try:
+        shutil.rmtree(directory)
+    except PermissionError:
+        # The host may use a different UID from the scorer's container.
+        subprocess.run([
+            "docker", "run", "--rm", "--platform", "linux/amd64", "--network", "none",
+            "--user", "1000:1000", "-v", f"{directory}:/run-data:z", "--entrypoint", "chmod",
+            image, "-R", "a+rwX", "/run-data",
+        ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        shutil.rmtree(directory)
+
+
+def benchmark(args):
+    samples = {(image, phase): [] for image in args.image for phase in PHASES}
+    with tempfile.TemporaryDirectory(prefix="shopping-benchmark-") as temp:
+        root = Path(temp)
+        empty = root / "headers"
+        header_only(args.data, empty)
+        for round_number in range(args.rounds + 1):
+            order = list(samples)
+            if round_number % 2 == 0:
+                order.reverse()
+            for image, phase in order:
+                data = empty if phase == "startup" else args.data
+                directory = Path(tempfile.mkdtemp(dir=root))
+                directory.chmod(0o755)
+                try:
+                    wall, engine, log = sample(image, phase, data, directory, args)
+                finally:
+                    clear(directory, image)
+                label = f"round {round_number}" if round_number else "warmup"
+                print(f"{label} {image} {phase} wall={wall:.6f}s engine={engine:.6f}s", flush=True)
+                if log:
+                    print(log, flush=True)
+                if round_number:
+                    samples[image, phase].append((wall, engine))
+    for (image, phase), timings in samples.items():
+        wall, engine = map(median, zip(*timings))
+        print(f"median {image} {phase} wall={wall:.6f}s engine={engine:.6f}s")
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("data", type=Path)
+    parser.add_argument("--image", action="append", help="benchmark image tag, repeat for comparisons")
+    parser.add_argument("--rounds", type=int, default=5)
+    parser.add_argument("--cpus", type=int, default=8)
+    parser.add_argument("--cpuset", default=os.environ.get("SHOPPING_CPUSET"))
+    parser.add_argument("--memory", default="24g")
+    args = parser.parse_args()
+    if platform.system() != "Linux" or platform.machine() != "x86_64":
+        parser.error("run on native x86-64 Linux for representative timings")
+    if args.rounds < 1 or args.cpus < 1:
+        parser.error("--rounds and --cpus must be positive")
+    args.image = args.image or ["shopping-sessions:benchmark"]
+    if not args.cpuset:
+        available = sorted(os.sched_getaffinity(0))
+        if len(available) < args.cpus:
+            parser.error(f"only {len(available)} CPUs available, pass --cpus or --cpuset")
+        args.cpuset = ",".join(map(str, available[:args.cpus]))
+    try:
+        args.data = args.data.resolve(strict=True)
+        if docker("info", "--format", "{{.OSType}} {{.Architecture}}") not in ("linux x86_64", "linux amd64"):
+            parser.error("the Docker daemon must also be Linux amd64")
+        benchmark(args)
+    except (subprocess.CalledProcessError, RuntimeError, OSError) as error:
+        print(error, file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

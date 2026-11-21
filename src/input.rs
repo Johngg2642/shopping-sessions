@@ -185,17 +185,17 @@ pub fn timestamp(bytes: &[u8]) -> Option<i64> {
         _ => return None,
     };
     let stamp = bytes.first_chunk::<20>().expect("ISO timestamp width");
-    Some(civil_millis::<true>(stamp)? - offset_minutes * 60_000)
+    Some((civil_seconds::<true>(stamp)? - offset_minutes * 60) * 1_000)
 }
 
-pub fn ingest_millis(bytes: &[u8]) -> i64 {
+pub fn ingest_seconds(bytes: &[u8]) -> i64 {
     // The spec guarantees every ingest field is a valid fixed-width UTC timestamp.
     let bytes: &[u8; 20] = bytes.try_into().expect("fixed-width ingest timestamp");
-    civil_millis::<false>(bytes).expect("valid ingest timestamp")
+    civil_seconds::<false>(bytes).expect("valid ingest timestamp")
 }
 
 #[inline]
-fn civil_millis<const CHECK: bool>(bytes: &[u8; 20]) -> Option<i64> {
+fn civil_seconds<const CHECK: bool>(bytes: &[u8; 20]) -> Option<i64> {
     let date = u64::from_le_bytes(bytes[..8].try_into().expect("eight date bytes"));
     let clock = u64::from_le_bytes(bytes[11..19].try_into().expect("eight time bytes"));
     if CHECK
@@ -232,7 +232,7 @@ fn civil_millis<const CHECK: bool>(bytes: &[u8; 20]) -> Option<i64> {
         return None;
     }
     let days = i64::from(entry >> 5) + day - 1;
-    Some(days * DAY + ((hour * 60 + minute) * 60 + second) * 1_000)
+    Some(days * (DAY / 1_000) + (hour * 60 + minute) * 60 + second)
 }
 
 const FIRST_CACHED_YEAR: i64 = 1970;

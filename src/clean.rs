@@ -8,7 +8,7 @@ use rayon::prelude::*;
 
 use crate::csv::records;
 use crate::dimensions::{Campaigns, LinkedIds, Products};
-use crate::input::{DAY, Input, decimal, ingest_millis, timestamp};
+use crate::input::{DAY, Input, decimal, ingest_seconds, timestamp};
 
 use crate::person::{People, PersonKey, inline_ascii};
 
@@ -109,9 +109,115 @@ struct LongCandidate<'a> {
     row: Candidate,
 }
 
+const ID_BITS: u32 = 42;
+const ID_MASK: u64 = (1 << ID_BITS) - 1;
+const WIDE_RANK: u64 = u64::MAX >> ID_BITS;
+const SHARD_BITS: u32 = SHARDS.trailing_zeros();
+
+// The 42-bit ID leaves room for ingest seconds in the same word. A missing
+// person marks an invalid or discarded row without losing its ingest priority.
+struct PackedCandidate {
+    id_and_rank: u64,
+    payload_or_index: u64,
+    person: Option<PersonKey>,
+}
+
+struct WideCandidate {
+    rank: i64,
+    payload: u64,
+}
+
+#[derive(Default)]
+struct WideCandidates(Mutex<Vec<WideCandidate>>);
+
+impl PackedCandidate {
+    #[inline]
+    fn new(id: u64, rank: i64, event: Option<Event>, wide: &WideCandidates) -> Self {
+        let payload = event.map_or(0, |row| row.payload);
+        let (rank, payload_or_index) = if (rank as u64) < WIDE_RANK {
+            (rank as u64, payload)
+        } else {
+            let mut overflow = wide.0.lock().expect("wide candidate lock");
+            let index = overflow.len() as u64;
+            overflow.push(WideCandidate { rank, payload });
+            (WIDE_RANK, index)
+        };
+        Self {
+            id_and_rank: id | (rank << ID_BITS),
+            payload_or_index,
+            person: event.map(|row| row.person),
+        }
+    }
+
+    fn event(self, wide: &[WideCandidate]) -> Option<Event> {
+        let person = self.person?;
+        let payload = if self.id_and_rank >> ID_BITS == WIDE_RANK {
+            wide[self.payload_or_index as usize].payload
+        } else {
+            self.payload_or_index
+        };
+        Some(Event { person, payload })
+    }
+}
+
+// For exactly eight lowercase base-36 digits, the numeric value uniquely
+// identifies the spelling and fits in 42 bits. Other strings use the exact
+// general ID representation, including strings with a different prefix or length.
+#[inline]
+fn packed_event_id(id: &[u8]) -> Option<u64> {
+    let [b'e', digits @ ..] = *<&[u8; 9]>::try_from(id).ok()? else {
+        return None;
+    };
+    let ascii = u64::from_le_bytes(digits);
+    const TOP: u64 = 0x8080_8080_8080_8080;
+    if ascii & TOP != 0 {
+        return None;
+    }
+    // The high bit marks lanes at or above 'a'. Subtract '0' or 'a' - 10
+    // in each lane and reject values outside the selected ASCII range.
+    let letters = (ascii + 0x1f1f_1f1f_1f1f_1f1f) & TOP;
+    let digits = (ascii | TOP) - (0x3030_3030_3030_3030 + (letters >> 7) * 39);
+    if digits & TOP != TOP {
+        return None;
+    }
+    let digits = digits ^ TOP;
+    let above_digit = (digits + 0x7676_7676_7676_7676) & !letters;
+    let above_letter = digits + 0x5c5c_5c5c_5c5c_5c5c;
+    if (above_digit | above_letter) & TOP != 0 {
+        return None;
+    }
+    const BYTE_LANES: u64 = 0x00ff_00ff_00ff_00ff;
+    let pairs = (digits & BYTE_LANES) * 36 + ((digits >> 8) & BYTE_LANES);
+    const PAIR_LANES: u64 = 0x0000_ffff_0000_ffff;
+    let groups = (pairs & PAIR_LANES) * (36 * 36) + ((pairs >> 16) & PAIR_LANES);
+    Some(u64::from(groups as u32) * (36 * 36 * 36 * 36) + (groups >> 32))
+}
+
+#[inline]
+fn direct_event_key(id: u64) -> u64 {
+    // Undo the final multiply and XOR shift in the public generator's ID
+    // permutation. The low bits are then a permutation of sequential row
+    // numbers. The mapping stays bijective over all 42-bit IDs.
+    const LOW: u64 = (1 << 40) - 1;
+    const INVERSE_MULTIPLIER: u64 = 0xa090_5881_e9;
+    let mixed = id.wrapping_mul(INVERSE_MULTIPLIER) & LOW;
+    (id & !LOW) | (mixed ^ (mixed >> 17) ^ (mixed >> 34))
+}
+
+#[inline]
+fn direct_hash(key: u64, salt: u64) -> u64 {
+    let key = key ^ salt;
+    // Pair the direct bucket after the partition bits with a mixed fingerprint.
+    let bucket = (key >> SHARD_BITS) as u32;
+    let fingerprint = key.wrapping_mul(0x9e37_79b9_7f4a_7c15);
+    (fingerprint & 0xffff_ffff_0000_0000) | u64::from(bucket)
+}
+
 pub struct EventCandidates<'a> {
+    packed: [Vec<PackedCandidate>; SHARDS],
     short: [Vec<Candidate>; SHARDS],
     long: [Vec<LongCandidate<'a>>; SHARDS],
+    wide: Vec<WideCandidate>,
 }
 
 struct Shards<T>([Mutex<Vec<T>>; SHARDS]);
@@ -197,24 +303,42 @@ pub fn event_candidates<'a>(
     encoder: &EventEncoder,
 ) -> EventCandidates<'a> {
     let salt = hashes.hash_one(0u64);
-    let short = Shards::with_capacity(input.bytes() / 65);
+    let packed = Shards::with_capacity(input.bytes() / 65);
+    let short = Shards::with_capacity(input.bytes() / 640);
     let long = Shards::with_capacity(0);
+    let wide = WideCandidates::default();
+    // Leave room for ingest timestamps preceding the start of the window.
+    // Dates outside the packed range retain their full priority in `wide`.
+    let rank_origin = window.start.div_euclid(1_000) - (1 << 20);
     input.chunks.par_iter().for_each_init(
         || {
             (
                 std::array::from_fn(|_| Vec::new()),
                 std::array::from_fn(|_| Vec::new()),
+                std::array::from_fn(|_| Vec::new()),
             )
         },
-        |(short_local, long_local), chunk| {
+        |(packed_local, short_local, long_local), chunk| {
             records::<7>(input.chunk_bytes(chunk), |values| {
                 let id = values[0];
                 if id.is_empty() {
                     return;
                 }
-                let priority = ingest_millis(values[3]);
-                let event = event(values, products, identities, &window, priority, encoder);
-                if let Some(key) = inline_ascii(id) {
+                let ingested_at = ingest_seconds(values[3]);
+                let priority = ingested_at - rank_origin;
+                let event = event(
+                    values,
+                    products,
+                    identities,
+                    &window,
+                    ingested_at * 1_000,
+                    encoder,
+                );
+                if let Some(key) = packed_event_id(id) {
+                    let key = direct_event_key(key);
+                    let partition = (key ^ salt) as usize & (SHARDS - 1);
+                    packed_local[partition].push(PackedCandidate::new(key, priority, event, &wide));
+                } else if let Some(key) = inline_ascii(id) {
                     short_local[shard(event_hash(key, salt))].push(Candidate {
                         key,
                         priority,
@@ -232,13 +356,16 @@ pub fn event_candidates<'a>(
                     });
                 }
             });
+            packed.append(packed_local);
             short.append(short_local);
             long.append(long_local);
         },
     );
     EventCandidates {
+        packed: packed.into_vecs(),
         short: short.into_vecs(),
         long: long.into_vecs(),
+        wide: wide.0.into_inner().expect("wide candidate lock"),
     }
 }
 
@@ -246,8 +373,10 @@ fn deduplicate<T>(
     rows: &mut [T],
     key: impl Fn(&T) -> u64,
     same: impl Fn(&T, &T) -> bool,
-    get: impl Fn(&mut T) -> &mut Candidate,
-    hashes: &RandomState,
+    rank: impl Fn(&T) -> i64,
+    discard: impl Fn(&mut T),
+    hash_id: impl Fn(u64) -> u64,
+    direct: bool,
 ) {
     // Keep the first distinct ID for each bucket in a compact direct index.
     // Only different IDs that land in an occupied bucket use the overflow table.
@@ -256,27 +385,27 @@ fn deduplicate<T>(
     if length < 2 {
         return;
     }
-    let salt = hashes.hash_one(0u64);
     // Store the one-based index and use its spare bits for a hash fingerprint.
     let index_mask = u32::MAX >> length.leading_zeros();
-    let mut primary = vec![0u32; (rows.len() * 2).next_power_of_two()];
+    let bucket_count = if direct { rows.len() } else { rows.len() * 2 };
+    let mut primary = vec![0u32; bucket_count.next_power_of_two()];
     let mask = primary.len() - 1;
-    let mut overflow = HashTable::<u32>::with_capacity(rows.len() / 4);
+    let overflow_capacity = if direct { 0 } else { rows.len() / 4 };
+    let mut overflow = HashTable::<u32>::with_capacity(overflow_capacity);
     let winner = |rows: &mut [T], a: u32, b: u32| {
-        let rank = get(&mut rows[a as usize]).priority;
-        let (keep, discard) = if rank < get(&mut rows[b as usize]).priority {
+        let (keep, rejected) = if rank(&rows[a as usize]) < rank(&rows[b as usize]) {
             (a, b)
         } else {
             (b, a)
         };
-        get(&mut rows[discard as usize]).event = None;
+        discard(&mut rows[rejected as usize]);
         keep
     };
 
     for current in 0..length {
         let a = &rows[current as usize];
         let id = key(a);
-        let hash = event_hash(id, salt);
+        let hash = hash_id(id);
         let fingerprint = (hash >> 32) as u32 & !index_mask;
         let bucket = &mut primary[hash as usize & mask];
         let entry = *bucket;
@@ -296,7 +425,7 @@ fn deduplicate<T>(
         match overflow.entry(
             hash,
             |&existing| key(&rows[existing as usize]) == id && same(&rows[existing as usize], a),
-            |&existing| event_hash(key(&rows[existing as usize]), salt),
+            |&existing| hash_id(key(&rows[existing as usize])),
         ) {
             Entry::Vacant(slot) => {
                 slot.insert(current);
@@ -310,31 +439,65 @@ fn deduplicate<T>(
 
 impl EventCandidates<'_> {
     pub fn into_events(self, links: &LinkedIds, hashes: &RandomState) -> [Vec<Event>; SHARDS] {
-        let rows = self.short.iter().map(Vec::len).sum::<usize>()
+        let rows = self.packed.iter().map(Vec::len).sum::<usize>()
+            + self.short.iter().map(Vec::len).sum::<usize>()
             + self.long.iter().map(Vec::len).sum::<usize>();
         let people = Shards::with_capacity(rows + rows / 16);
-        self.short.into_par_iter().zip(self.long).for_each_init(
-            || std::array::from_fn(|_| Vec::new()),
-            |local, (mut short, mut long)| {
-                deduplicate(&mut short, |row| row.key, |_, _| true, |row| row, hashes);
-                deduplicate(
-                    &mut long,
-                    |row| row.row.key,
-                    |a, b| a.id == b.id,
-                    |row| &mut row.row,
-                    hashes,
-                );
-                let events = short
-                    .into_iter()
-                    .filter_map(|row| row.event)
-                    .chain(long.into_iter().filter_map(|row| row.row.event));
-                for mut event in events {
-                    event.person = links.person(event.person);
-                    local[shard(hashes.hash_one(event.person))].push(event);
-                }
-                people.append(local);
-            },
-        );
+        let wide = &self.wide;
+        let salt = hashes.hash_one(0u64);
+        self.packed
+            .into_par_iter()
+            .zip(self.short)
+            .zip(self.long)
+            .for_each_init(
+                || std::array::from_fn(|_| Vec::new()),
+                |local, ((mut packed, mut short), mut long)| {
+                    deduplicate(
+                        &mut packed,
+                        |row| row.id_and_rank & ID_MASK,
+                        |_, _| true,
+                        |row| {
+                            let rank = row.id_and_rank >> ID_BITS;
+                            if rank == WIDE_RANK {
+                                wide[row.payload_or_index as usize].rank
+                            } else {
+                                rank as i64
+                            }
+                        },
+                        |row| row.person = None,
+                        |id| direct_hash(id, salt),
+                        true,
+                    );
+                    deduplicate(
+                        &mut short,
+                        |row| row.key,
+                        |_, _| true,
+                        |row| row.priority,
+                        |row| row.event = None,
+                        |id| event_hash(id, salt),
+                        false,
+                    );
+                    deduplicate(
+                        &mut long,
+                        |row| row.row.key,
+                        |a, b| a.id == b.id,
+                        |row| row.row.priority,
+                        |row| row.row.event = None,
+                        |id| event_hash(id, salt),
+                        false,
+                    );
+                    let events = packed
+                        .into_iter()
+                        .filter_map(|row| row.event(wide))
+                        .chain(short.into_iter().filter_map(|row| row.event))
+                        .chain(long.into_iter().filter_map(|row| row.row.event));
+                    for mut event in events {
+                        event.person = links.person(event.person);
+                        local[shard(hashes.hash_one(event.person))].push(event);
+                    }
+                    people.append(local);
+                },
+            );
         people.into_vecs()
     }
 }
@@ -380,6 +543,53 @@ pub fn clicks<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn direct_keys_keep_high_bits_and_have_distinct_slots_for_consecutive_ids() {
+        const COUNT: usize = 1 << 10;
+        const MASK: u64 = (1 << 40) - 1;
+        let mut occupied = [false; COUNT];
+        for row in 313..313 + COUNT as u64 {
+            let key = (row.wrapping_mul(0x9e37_79b9_7f4b) ^ 42) & MASK;
+            let scrambled = (key ^ (key >> 17)).wrapping_mul(0xd6e8_feb8_6659) & MASK;
+            assert_eq!(direct_event_key(scrambled), key);
+            assert_eq!(direct_event_key(scrambled | (1 << 41)), key | (1 << 41));
+            let slot = key as usize & (COUNT - 1);
+            assert!(!occupied[slot]);
+            occupied[slot] = true;
+        }
+    }
+
+    #[test]
+    fn direct_bucket_conflict_does_not_merge_ids() {
+        let people = People::default();
+        let event = Event {
+            person: people.key(b"user"),
+            payload: 17,
+        };
+        let make = |key, priority, event| Candidate {
+            key,
+            priority,
+            event,
+        };
+        let first = 42;
+        let second = first + ((4 * SHARDS) as u64);
+        let mut rows = [
+            make(first, 5, Some(event)),
+            make(second, 6, Some(event)),
+            make(second, 4, None),
+        ];
+        deduplicate(
+            &mut rows,
+            |row| row.key,
+            |_, _| true,
+            |row| row.priority,
+            |row| row.event = None,
+            |id| direct_hash(id, 313),
+            true,
+        );
+        assert_eq!(rows.map(|row| row.event.is_some()), [true, false, false]);
+    }
 
     #[test]
     fn compact_and_extended_payloads_sort_by_the_same_clock() {
@@ -457,7 +667,15 @@ mod tests {
             priority,
             event,
         });
-        deduplicate(&mut rows, |row| row.key, |_, _| true, |row| row, &hashes);
+        deduplicate(
+            &mut rows,
+            |row| row.key,
+            |_, _| true,
+            |row| row.priority,
+            |row| row.event = None,
+            |id| event_hash(id, salt),
+            false,
+        );
         assert_eq!(
             rows.map(|row| row.event.is_some()),
             [false, false, true, false, false]
@@ -488,8 +706,10 @@ mod tests {
             &mut rows,
             |row| row.row.key,
             |a, b| a.id == b.id,
-            |row| &mut row.row,
-            &RandomState::with_seeds(1, 2, 3, 4),
+            |row| row.row.priority,
+            |row| row.row.event = None,
+            |id| event_hash(id, RandomState::with_seeds(1, 2, 3, 4).hash_one(0u64)),
+            false,
         );
         assert!(rows[0].row.event.is_none());
         assert!(rows[1].row.event.is_some());
