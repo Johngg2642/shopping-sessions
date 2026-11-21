@@ -114,7 +114,7 @@ pub fn decimal(mut bytes: &[u8], max: i64) -> Option<i64> {
     }
     let mut value = 0u64;
     if let Some(prefix) = bytes.first_chunk::<8>() {
-        value = decimal_eight(prefix)?;
+        value = decimal_eight(u64::from_le_bytes(*prefix))?;
         bytes = &bytes[8..];
     }
     for &byte in bytes {
@@ -128,8 +128,7 @@ pub fn decimal(mut bytes: &[u8], max: i64) -> Option<i64> {
 }
 
 #[inline]
-fn decimal_eight(bytes: &[u8; 8]) -> Option<u64> {
-    let bytes = u64::from_le_bytes(*bytes);
+fn decimal_eight(bytes: u64) -> Option<u64> {
     if !eight_ascii_digits(bytes) {
         return None;
     }
@@ -158,6 +157,13 @@ fn pair(bytes: &[u8], start: usize) -> Option<i64> {
 }
 
 pub fn timestamp(bytes: &[u8]) -> Option<i64> {
+    if let Ok(digits) = <&[u8; 13]>::try_from(bytes) {
+        let high = u64::from_le_bytes(digits[..8].try_into().expect("eight leading digits"));
+        let low = u64::from_le_bytes(digits[5..].try_into().expect("eight trailing digits"));
+        // Replace the overlap with three ASCII zeros to decode the last five digits.
+        let low = (low & !0xff_ffff) | 0x30_3030;
+        return Some((decimal_eight(high)? * 100_000 + decimal_eight(low)?) as i64);
+    }
     // Inspect the date separator first. Epoch milliseconds can have any length.
     if bytes.get(4) != Some(&b'-') {
         return decimal(bytes, i64::MAX);
@@ -275,4 +281,21 @@ const fn civil_day(year: i64, month: i64, day: i64) -> i64 {
         + day
         - 1
         - 719_468
+}
+
+#[cfg(test)]
+mod tests {
+    use super::timestamp;
+
+    #[test]
+    fn thirteen_digit_timestamps_validate_every_digit() {
+        assert_eq!(timestamp(b"0000000000001"), Some(1));
+        let stamp = *b"1791071890000";
+        assert_eq!(timestamp(&stamp), Some(1_791_071_890_000));
+        for pos in 0..stamp.len() {
+            let mut invalid = stamp;
+            invalid[pos] = b':';
+            assert_eq!(timestamp(&invalid), None);
+        }
+    }
 }

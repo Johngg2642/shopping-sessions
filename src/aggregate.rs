@@ -14,6 +14,12 @@ pub struct CampaignDay {
 }
 
 impl CampaignDay {
+    fn credit(&mut self, revenue: i64) {
+        self.sessions += 1;
+        self.purchasing_sessions += i64::from(revenue > 0);
+        self.revenue += revenue;
+    }
+
     fn merge(&mut self, other: Self) {
         self.sessions += other.sessions;
         self.purchasing_sessions += other.purchasing_sessions;
@@ -252,6 +258,15 @@ impl<'a> Aggregator<'a> {
     }
 
     fn attribute(&mut self, clicks: &[Click<'_>]) {
+        if clicks.is_empty() {
+            for session in &self.sessions {
+                self.campaigns
+                    .get_mut(self.organic, utc_day(session.start))
+                    .credit(session.revenue);
+            }
+            return;
+        }
+
         let mut next = 0;
         for session in &self.sessions {
             while next < clicks.len() && clicks[next].time <= session.start {
@@ -290,10 +305,9 @@ impl<'a> Aggregator<'a> {
                 .map(|index| &clicks[index])
                 .filter(|click| click.time >= session.start - WEEK)
                 .map_or(self.organic, |click| click.campaign);
-            let totals = self.campaigns.get_mut(campaign, utc_day(session.start));
-            totals.sessions += 1;
-            totals.purchasing_sessions += i64::from(session.revenue > 0);
-            totals.revenue += session.revenue;
+            self.campaigns
+                .get_mut(campaign, utc_day(session.start))
+                .credit(session.revenue);
         }
 
         for campaign in self.touched_campaigns.drain(..) {

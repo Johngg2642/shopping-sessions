@@ -163,7 +163,7 @@ fn event<'a>(
         return None;
     }
     let time = timestamp(time)?;
-    if !window.contains(&time) || ingest - time > DAY {
+    if !window.contains(&time) || ingest - DAY > time {
         return None;
     }
     let (price, category) = match kind {
@@ -360,7 +360,7 @@ pub fn clicks<'a>(
                 let Some(time) = timestamp(time).filter(|time| window.contains(time)) else {
                     return;
                 };
-                let Some(&campaign) = campaigns.codes.get(campaign) else {
+                let Some(campaign) = campaigns.code(campaign) else {
                     return;
                 };
                 let person = links.person(identities.key(user));
