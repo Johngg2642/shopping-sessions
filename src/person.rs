@@ -9,6 +9,20 @@ pub fn inline_ascii(name: &[u8]) -> Option<u64> {
     if name.len() > 9 {
         return None;
     }
+    if let Some(prefix) = name.first_chunk::<8>() {
+        let bytes = u64::from_be_bytes(*prefix);
+        const TOP: u64 = 0x8080_8080_8080_8080;
+        let zero_bytes = bytes.wrapping_sub(0x0101_0101_0101_0101) & !bytes & TOP;
+        if (bytes & TOP) | zero_bytes != 0 {
+            return None;
+        }
+        let prefix = pack_seven_bit_lanes(bytes);
+        return match name.get(8) {
+            None => Some(prefix),
+            Some(&last) if (1..128).contains(&last) => Some((prefix << 7) | u64::from(last)),
+            _ => None,
+        };
+    }
     let mut bits = 0;
     for &byte in name {
         if byte == 0 || byte >= 128 {
@@ -17,6 +31,21 @@ pub fn inline_ascii(name: &[u8]) -> Option<u64> {
         bits = (bits << 7) | u64::from(byte);
     }
     Some(bits)
+}
+
+#[inline]
+fn pack_seven_bit_lanes(bytes: u64) -> u64 {
+    #[cfg(all(target_arch = "x86_64", target_feature = "bmi2"))]
+    {
+        // The x86-64-v3 build guarantees BMI2.
+        unsafe { std::arch::x86_64::_pext_u64(bytes, 0x7f7f_7f7f_7f7f_7f7f) }
+    }
+    #[cfg(not(all(target_arch = "x86_64", target_feature = "bmi2")))]
+    {
+        let pairs = (bytes & 0x007f_007f_007f_007f) | ((bytes & 0x7f00_7f00_7f00_7f00) >> 1);
+        let quads = (pairs & 0x0000_3fff_0000_3fff) | ((pairs & 0x3fff_0000_3fff_0000) >> 2);
+        (quads & 0x0000_0000_0fff_ffff) | ((quads & 0x0fff_ffff_0000_0000) >> 4)
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]

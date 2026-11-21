@@ -1,5 +1,6 @@
 mod aggregate;
 mod clean;
+mod csv;
 mod dimensions;
 mod input;
 mod output;
@@ -15,8 +16,8 @@ use std::time::Instant;
 use ahash::RandomState;
 use rayon::prelude::*;
 
-use crate::aggregate::{Aggregator, CampaignDays};
-use crate::clean::{Click, Event};
+use crate::aggregate::{Aggregator, CampaignDays, CampaignLayout};
+use crate::clean::{Click, Event, Repeats};
 use crate::dimensions::{Campaigns, LinkedIds, Products};
 use crate::input::{Input, WEEK, map_file, timestamp};
 use crate::output::{Error, Users};
@@ -44,9 +45,13 @@ fn process(
     campaigns: &Campaigns<'_>,
     products: &Products<'_>,
     interned: &[&[u8]],
+    layout: CampaignLayout,
     path: &Path,
 ) -> Result<CampaignDays, Error> {
-    events.sort_unstable_by_key(|event| (event.person, event.time));
+    events.sort_unstable_by_key(|event| event.person);
+    for person in events.chunk_by_mut(|a, b| a.person == b.person) {
+        person.sort_unstable_by_key(|event| event.time);
+    }
     clicks.sort_unstable_by(|a, b| {
         a.person
             .cmp(&b.person)
@@ -56,7 +61,7 @@ fn process(
     clicks.dedup_by(|a, b| a.person == b.person && a.time == b.time && a.id == b.id);
 
     let mut users = Users::new(path)?;
-    let mut aggregator = Aggregator::new(&products.categories, campaigns.organic);
+    let mut aggregator = Aggregator::new(&products.categories, campaigns.organic, layout);
     let mut rows = Vec::with_capacity(8192);
     let mut click_groups = clicks.chunk_by(|a, b| a.person == b.person).peekable();
 
@@ -108,32 +113,40 @@ fn run(data: &Path, out: &Path) -> Result<(), Error> {
     let products = Products::new(product_input.as_deref().unwrap_or_default())?;
     let campaigns = Campaigns::new(campaign_input.as_deref().unwrap_or_default())?;
     let links = Input::open(&data.join("links"))?;
-    let linked_ids = LinkedIds::new(&links);
-    elapsed("dimensions and linked IDs");
-
     let hashes = RandomState::new();
     let event_input = Input::open(&data.join("events"))?;
     let click_input = Input::open(&data.join("clicks"))?;
     let identities = People::default();
-    let events = clean::events(
-        &event_input,
-        &linked_ids,
-        &products,
-        &identities,
-        window.clone(),
-        &hashes,
+    let (linked_ids, repeats) = rayon::join(
+        || LinkedIds::new(&links, &identities),
+        || Repeats::new(&event_input, &hashes),
     );
-    elapsed("events");
-    let clicks = clean::clicks(
-        &click_input,
-        &linked_ids,
-        &campaigns,
-        &identities,
-        window.start - WEEK..window.end,
-        &hashes,
+    elapsed("dimensions, linked IDs, and repeat screening");
+    let (events, clicks) = rayon::join(
+        || {
+            clean::events(
+                &event_input,
+                &linked_ids,
+                &products,
+                &identities,
+                window.clone(),
+                &hashes,
+                &repeats,
+            )
+        },
+        || {
+            clean::clicks(
+                &click_input,
+                &linked_ids,
+                &campaigns,
+                &identities,
+                window.start - WEEK..window.end,
+                &hashes,
+            )
+        },
     );
     let interned = identities.into_names();
-    elapsed("clicks");
+    elapsed("parse and deduplicate events and clicks");
 
     let user_dir = out.join("user_daily");
     let campaign_dir = out.join("campaign_daily");
@@ -143,6 +156,7 @@ fn run(data: &Path, out: &Path) -> Result<(), Error> {
         Users::new(&user_dir.join("part-000.parquet"))?.finish()?;
     }
 
+    let layout = CampaignLayout::new(window.start, window.end, campaigns.labels.len());
     let totals = events
         .into_par_iter()
         .zip(clicks)
@@ -155,15 +169,13 @@ fn run(data: &Path, out: &Path) -> Result<(), Error> {
                 &campaigns,
                 &products,
                 &interned,
+                layout,
                 &user_dir.join(format!("part-{part:03}.parquet")),
             )
         })
-        .try_reduce(CampaignDays::default, |mut left, right| {
-            for (key, totals) in right {
-                left.entry(key).or_default().merge(totals);
-            }
-            Ok(left)
-        })?;
+        .try_reduce_with(|left, right| Ok(left.merge(right)))
+        .transpose()?
+        .unwrap_or_else(|| CampaignDays::new(layout));
     elapsed("sort, sessionize, attribute, and write users");
     output::campaigns(
         &campaign_dir.join("part-000.parquet"),

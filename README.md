@@ -32,16 +32,16 @@ PROFILE=1 make run-dev
 make check-dev PYTHON=.venv/bin/python
 ```
 
-Docker builds for `linux/amd64` by default. On Apple silicon, `PLATFORM=linux/arm64` gives faster local Docker iterations. Use native amd64 Linux for representative scorer timings. The amd64 image targets the x86-64-v3 instruction set and runs as UID 1000 with the read-only and offline settings in `scripts/docker_run.sh`.
+Docker builds for `linux/amd64` by default. On Apple silicon, `PLATFORM=linux/arm64` gives faster local Docker iterations. Use native amd64 Linux for representative scorer timings. The amd64 image targets x86-64-v3 with AES-NI for the scorer’s Xeon CPUs. It runs as UID 1000 with the read-only and offline settings in `scripts/docker_run.sh`.
 
 ## Pipeline
 
-1. Parse newline-aligned chunks of memory-mapped files in parallel. Large files supply multiple chunks so they can use multiple workers. Only LF ends a row, and each field’s quotes are checked before deduplication. Spaces and carriage returns remain in field values.
-2. Build linked components with union by size and path compression. Each root tracks its byte-wise minimum ID, including IDs absent from events and clicks.
-3. Partition events by event ID for global deduplication. Each candidate carries its row position and a compact ingest timestamp. Short ASCII IDs are stored exactly, and matches on hashed IDs are checked against the original ID bytes. Retain the positions of discarded copies, then scan the files in order to validate and assign survivors to their canonical person. An invalid earliest event copy still suppresses later copies.
+1. Process newline-aligned chunks of memory-mapped files in parallel. The CSV parser scans commas and quotes with vector instructions on short rows and has a scalar path for any row length. Only LF ends a row. Spaces and carriage returns remain in field values.
+2. Build linked components with union by size and path compression. Each root tracks its byte-wise minimum ID, including IDs absent from events and clicks. Encode the resulting aliases as a numeric lookup for the event and click workers.
+3. Screen the event IDs for repeats while building the link graph. The screen uses a shared bitmap. Collisions can send extra rows to exact deduplication. Rows in buckets seen once bypass the deduplication table. Parse each full row once, and retain all possible duplicate candidates until the earliest ingest timestamp wins. An invalid earliest event copy still suppresses later copies.
 4. Store canonical person IDs as 64-bit keys. Up to nine nonzero ASCII bytes fit inline, and other names use an exact dictionary. Sort each person shard in place and scan its events once to build sessions and daily category totals. Clicks use the same person keys. The click sort puts identical copies next to each other for deduplication and orders equal timestamps by descending click ID so the last eligible click has the smallest ID.
 5. Merge overlapping seven-day coverage intervals per campaign. Use binary searches on session starts to count each interval by UTC day. This bounds work when a shared device ties thousands of user IDs together and each campaign has many qualifying clicks.
-6. Write user-day output in parallel, reduce campaign totals across shards, and write the campaign-day table. Both outputs use Parquet DATE columns and 64-bit counts and revenue.
+6. Write user-day output in parallel, reduce campaign totals across shards, and write the campaign-day table. A bounded dense array holds campaign totals for ordinary date windows and a sparse map handles wider ones. Both outputs use Parquet DATE columns and 64-bit counts and revenue.
 
 The `dev/`, `dev-answer/`, and generated benchmark data stay outside Git. The repository includes the 36 small fixtures and their expected results.
 

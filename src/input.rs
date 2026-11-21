@@ -5,6 +5,8 @@ use std::path::Path;
 use memchr::{memchr, memchr_iter};
 use memmap2::{Mmap, MmapOptions};
 
+pub use crate::csv::fields;
+
 pub const DAY: i64 = 86_400_000;
 pub const WEEK: i64 = 7 * DAY;
 const CHUNK_BYTES: usize = 2 * 1024 * 1024;
@@ -29,25 +31,6 @@ pub struct Chunk {
     file: usize,
     start: usize,
     end: usize,
-}
-
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub struct Position(u64);
-
-impl Position {
-    fn new(file: usize, offset: usize) -> Self {
-        Self(((file as u64) << OFFSET_BITS) | offset as u64)
-    }
-}
-
-impl Chunk {
-    pub fn rejected<'a>(&self, rejected: &'a [Position]) -> &'a [Position] {
-        let start = Position::new(self.file, self.start);
-        let end = Position::new(self.file, self.end);
-        let first = rejected.partition_point(|&position| position < start);
-        let count = rejected[first..].partition_point(|&position| position < end);
-        &rejected[first..first + count]
-    }
 }
 
 impl Input {
@@ -81,22 +64,12 @@ impl Input {
         Ok(Self { files, chunks })
     }
 
-    pub fn rows<'a>(&'a self, chunk: &'a Chunk) -> impl Iterator<Item = (Position, &'a [u8])> {
-        let mut offset = chunk.start;
-        self.files[chunk.file][chunk.start..chunk.end]
-            .split_terminator_byte(b'\n')
-            .map(move |line| {
-                let position = Position::new(chunk.file, offset);
-                offset += line.len() + 1;
-                (position, line)
-            })
+    pub fn rows<'a>(&'a self, chunk: &'a Chunk) -> impl Iterator<Item = &'a [u8]> {
+        self.files[chunk.file][chunk.start..chunk.end].split_terminator_byte(b'\n')
     }
 
-    pub fn row(&self, position: Position) -> &[u8] {
-        let file = (position.0 >> OFFSET_BITS) as usize;
-        let offset = (position.0 & OFFSET_MASK) as usize;
-        let bytes = &self.files[file][offset..];
-        &bytes[..memchr(b'\n', bytes).unwrap_or(bytes.len())]
+    pub fn bytes(&self) -> usize {
+        self.files.iter().map(|file| file.len()).sum()
     }
 }
 
@@ -125,40 +98,16 @@ impl SplitByte for [u8] {
     }
 }
 
-pub fn fields<const N: usize>(line: &[u8]) -> Option<[&[u8]; N]> {
-    let mut output = [b"".as_slice(); N];
-    let mut start = 0;
-    let mut commas = memchr_iter(b',', line);
-    for (index, field) in output.iter_mut().enumerate() {
-        let end = if index + 1 == N {
-            if commas.next().is_some() {
-                return None;
-            }
-            line.len()
-        } else {
-            commas.next()?
-        };
-        let mut value = &line[start..end];
-        if value.first() == Some(&b'"') {
-            value = value.get(1..)?.strip_suffix(b"\"")?;
-        }
-        if memchr(b'"', value).is_some() {
-            return None;
-        }
-        *field = value;
-        start = end + 1;
-    }
-    Some(output)
-}
-
-// Call only for previously validated rows.
-pub fn id(line: &[u8]) -> &[u8] {
-    let first = &line[..memchr(b',', line).expect("validated CSV")];
-    if first.first() == Some(&b'"') {
-        &first[1..first.len() - 1]
+// A malformed row can add a false positive here. Valid IDs use the same
+// unquoted bytes during the full parse, so no actual repeat is missed.
+pub fn first_id(line: &[u8]) -> Option<&[u8]> {
+    let first = &line[..memchr(b',', line)?];
+    let id = if let Some(quoted) = first.strip_prefix(b"\"") {
+        quoted.strip_suffix(b"\"")?
     } else {
         first
-    }
+    };
+    (!id.is_empty()).then_some(id)
 }
 
 pub fn decimal(mut bytes: &[u8], max: i64) -> Option<i64> {
@@ -171,15 +120,34 @@ pub fn decimal(mut bytes: &[u8], max: i64) -> Option<i64> {
     if bytes.len() > 19 {
         return None;
     }
-    let mut value = 0i64;
+    let mut value = 0u64;
+    if let Some(prefix) = bytes.first_chunk::<8>() {
+        value = decimal_eight(prefix)?;
+        bytes = &bytes[8..];
+    }
     for &byte in bytes {
         let digit = byte.wrapping_sub(b'0');
         if digit > 9 {
             return None;
         }
-        value = value.checked_mul(10)?.checked_add(i64::from(digit))?;
+        value = value * 10 + u64::from(digit);
     }
-    (value <= max).then_some(value)
+    (value <= max as u64).then_some(value as i64)
+}
+
+#[inline]
+fn decimal_eight(bytes: &[u8; 8]) -> Option<u64> {
+    const HIGH: u64 = 0xf0f0_f0f0_f0f0_f0f0;
+    const ASCII: u64 = 0x3030_3030_3030_3030;
+    let bytes = u64::from_le_bytes(*bytes);
+    if bytes & HIGH != ASCII || (bytes + 0x0606_0606_0606_0606) & HIGH != ASCII {
+        return None;
+    }
+    // Reduce eight validated ASCII digits to four pairs, two quads, then one value.
+    let digits = bytes & !HIGH;
+    let pairs = (digits.wrapping_mul(10) + (digits >> 8)) & 0x00ff_00ff_00ff_00ff;
+    let quads = (pairs.wrapping_mul(100) + (pairs >> 16)) & 0x0000_ffff_0000_ffff;
+    Some((quads.wrapping_mul(10_000) + (quads >> 32)) & 0xffff_ffff)
 }
 
 fn pair(bytes: &[u8], start: usize) -> Option<i64> {
@@ -215,25 +183,70 @@ pub fn timestamp(bytes: &[u8]) -> Option<i64> {
     let year = pair(bytes, 0)? * 100 + pair(bytes, 2)?;
     let (month, day) = (pair(bytes, 5)?, pair(bytes, 8)?);
     let (hour, minute, second) = (pair(bytes, 11)?, pair(bytes, 14)?, pair(bytes, 17)?);
-    let days_in_month = match month {
-        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
-        4 | 6 | 9 | 11 => 30,
-        2 => 28 + i64::from(year % 4 == 0 && (year % 100 != 0 || year % 400 == 0)),
-        _ => return None,
-    };
-    if day == 0 || day > days_in_month || hour > 23 || minute > 59 || second > 59 {
+    if !(1..=12).contains(&month) || day == 0 || hour > 23 || minute > 59 || second > 59 {
         return None;
     }
+    let entry = calendar_month(year, month);
+    if day > i64::from(entry & 31) {
+        return None;
+    }
+    let days = i64::from(entry >> 5) + day - 1;
+    Some(days * DAY + ((hour * 60 + minute - offset_minutes) * 60 + second) * 1_000)
+}
 
+pub fn ingest_millis(bytes: &[u8]) -> i64 {
+    // The spec guarantees every ingest field is a valid fixed-width UTC timestamp.
+    let bytes: &[u8; 20] = bytes.try_into().expect("fixed-width ingest timestamp");
+    let pair = |i: usize| i64::from(bytes[i] - b'0') * 10 + i64::from(bytes[i + 1] - b'0');
+    let month = calendar_month(pair(0) * 100 + pair(2), pair(5));
+    let days = i64::from(month >> 5) + pair(8) - 1;
+    days * DAY + ((pair(11) * 60 + pair(14)) * 60 + pair(17)) * 1_000
+}
+
+const FIRST_CACHED_YEAR: i64 = 1970;
+const CACHED_YEARS: usize = 130;
+const CACHED_MONTHS: usize = CACHED_YEARS * 12;
+
+static MONTHS: [i32; CACHED_MONTHS] = {
+    let mut months = [0; CACHED_MONTHS];
+    let mut index = 0;
+    while index < months.len() {
+        months[index] = build_month(
+            FIRST_CACHED_YEAR + (index / 12) as i64,
+            (index % 12 + 1) as i64,
+        );
+        index += 1;
+    }
+    months
+};
+
+fn calendar_month(year: i64, month: i64) -> i32 {
+    let index = ((year - FIRST_CACHED_YEAR) * 12 + month - 1) as usize;
+    MONTHS
+        .get(index)
+        .copied()
+        .unwrap_or_else(|| build_month(year, month))
+}
+
+const fn build_month(year: i64, month: i64) -> i32 {
+    let first = civil_day(year, month, 1);
+    let next = if month == 12 {
+        civil_day(year + 1, 1, 1)
+    } else {
+        civil_day(year, month + 1, 1)
+    };
+    (first as i32) << 5 | (next - first) as i32
+}
+
+const fn civil_day(year: i64, month: i64, day: i64) -> i64 {
     // Proleptic Gregorian days since 1970-01-01, with the year starting in March.
-    let march_year = year - i64::from(month <= 2);
+    let march_year = year - (month <= 2) as i64;
     let era = march_year.div_euclid(400);
     let year_of_era = march_year - era * 400;
     let march_month = if month > 2 { month - 3 } else { month + 9 };
-    let days = era * 146_097 + year_of_era * 365 + year_of_era / 4 - year_of_era / 100
+    era * 146_097 + year_of_era * 365 + year_of_era / 4 - year_of_era / 100
         + (153 * march_month + 2) / 5
         + day
         - 1
-        - 719_468;
-    Some(days * DAY + ((hour * 60 + minute - offset_minutes) * 60 + second) * 1_000)
+        - 719_468
 }

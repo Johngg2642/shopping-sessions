@@ -4,12 +4,12 @@ use std::io;
 use ahash::RandomState;
 
 use crate::input::{Input, data_rows, fields};
+use crate::person::{People, PersonKey};
 
 pub type Map<K, V> = HashMap<K, V, RandomState>;
 
-pub struct LinkedIds<'a> {
-    ids: Map<&'a [u8], usize>,
-    representatives: Vec<&'a [u8]>,
+pub struct LinkedIds {
+    representatives: Map<PersonKey, PersonKey>,
 }
 
 struct Node<'a> {
@@ -26,12 +26,12 @@ fn root(nodes: &mut [Node<'_>], mut index: usize) -> usize {
     index
 }
 
-impl<'a> LinkedIds<'a> {
-    pub fn new(input: &'a Input) -> Self {
-        let mut ids = Map::default();
+impl LinkedIds {
+    pub fn new<'a>(input: &'a Input, people: &People<'a>) -> Self {
+        let mut ids = Map::with_capacity_and_hasher(input.bytes() / 24, RandomState::new());
         let mut nodes = Vec::new();
         for chunk in &input.chunks {
-            for (_, row) in input.rows(chunk) {
+            for row in input.rows(chunk) {
                 let Some([left, right]) = fields::<2>(row) else {
                     continue;
                 };
@@ -39,7 +39,7 @@ impl<'a> LinkedIds<'a> {
                     continue;
                 }
                 let [mut a, mut b] = [left, right].map(|id| {
-                    let index = *ids.entry(id).or_insert_with(|| {
+                    let index = *ids.entry(people.key(id)).or_insert_with(|| {
                         let index = nodes.len();
                         nodes.push(Node {
                             parent: index,
@@ -62,22 +62,23 @@ impl<'a> LinkedIds<'a> {
             }
         }
 
-        let representatives = (0..nodes.len())
+        let canonical: Vec<_> = (0..nodes.len())
             .map(|index| {
                 let index = root(&mut nodes, index);
-                nodes[index].minimum
+                people.key(nodes[index].minimum)
             })
             .collect();
-        Self {
-            ids,
-            representatives,
-        }
+        let mut representatives = Map::with_capacity_and_hasher(ids.len(), RandomState::new());
+        representatives.extend(ids.into_iter().filter_map(|(key, index)| {
+            let person = canonical[index];
+            (key != person).then_some((key, person))
+        }));
+        Self { representatives }
     }
 
-    pub fn person(&self, id: &'a [u8]) -> &'a [u8] {
-        self.ids
-            .get(id)
-            .map_or(id, |&index| self.representatives[index])
+    #[inline]
+    pub fn person(&self, key: PersonKey) -> PersonKey {
+        self.representatives.get(&key).copied().unwrap_or(key)
     }
 }
 
