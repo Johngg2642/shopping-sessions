@@ -138,6 +138,14 @@ impl<T> Shards<T> {
     }
 }
 
+#[inline]
+fn event_hash(key: u64, salt: u64) -> u64 {
+    // Mix both halves of a full-width product so the partition and table
+    // index can use separate bits. Lookups still compare exact IDs.
+    let product = u128::from(key ^ salt) * u128::from(0xa076_1d64_78bd_642f_u64);
+    product as u64 ^ (product >> 64) as u64
+}
+
 fn shard(hash: u64) -> usize {
     // Reserve the low bits for the local hash table's bucket index.
     (hash >> 32) as usize & (SHARDS - 1)
@@ -188,6 +196,7 @@ pub fn event_candidates<'a>(
     hashes: &RandomState,
     encoder: &EventEncoder,
 ) -> EventCandidates<'a> {
+    let salt = hashes.hash_one(0u64);
     let short = Shards::with_capacity(input.bytes() / 65);
     let long = Shards::with_capacity(0);
     input.chunks.par_iter().for_each_init(
@@ -206,7 +215,7 @@ pub fn event_candidates<'a>(
                 let priority = ingest_millis(values[3]);
                 let event = event(values, products, identities, &window, priority, encoder);
                 if let Some(key) = inline_ascii(id) {
-                    short_local[shard(hashes.hash_one(key))].push(Candidate {
+                    short_local[shard(event_hash(key, salt))].push(Candidate {
                         key,
                         priority,
                         event,
@@ -247,6 +256,7 @@ fn deduplicate<T>(
     if length < 2 {
         return;
     }
+    let salt = hashes.hash_one(0u64);
     // Store the one-based index and use its spare bits for a hash fingerprint.
     let index_mask = u32::MAX >> length.leading_zeros();
     let mut primary = vec![0u32; (rows.len() * 2).next_power_of_two()];
@@ -266,7 +276,7 @@ fn deduplicate<T>(
     for current in 0..length {
         let a = &rows[current as usize];
         let id = key(a);
-        let hash = hashes.hash_one(id);
+        let hash = event_hash(id, salt);
         let fingerprint = (hash >> 32) as u32 & !index_mask;
         let bucket = &mut primary[hash as usize & mask];
         let entry = *bucket;
@@ -286,7 +296,7 @@ fn deduplicate<T>(
         match overflow.entry(
             hash,
             |&existing| key(&rows[existing as usize]) == id && same(&rows[existing as usize], a),
-            |&existing| hashes.hash_one(key(&rows[existing as usize])),
+            |&existing| event_hash(key(&rows[existing as usize]), salt),
         ) {
             Entry::Vacant(slot) => {
                 slot.insert(current);
@@ -421,9 +431,10 @@ mod tests {
     #[test]
     fn colliding_ids_choose_their_own_earliest_copy() {
         let hashes = RandomState::with_seeds(1, 2, 3, 4);
+        let salt = hashes.hash_one(0u64);
         let key_a = 1u64;
         let key_b = (2u64..)
-            .find(|&key| hashes.hash_one(key) & 15 == hashes.hash_one(key_a) & 15)
+            .find(|&key| event_hash(key, salt) & 15 == event_hash(key_a, salt) & 15)
             .expect("colliding key");
         let people = People::default();
         let event = EventEncoder::new(0).pack(

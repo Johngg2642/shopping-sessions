@@ -59,6 +59,67 @@ fn fields_from_masks<const N: usize>(line: &[u8]) -> Option<[&[u8]; N]> {
     parse_masks(line, commas, quotes)
 }
 
+#[cfg(all(target_arch = "x86_64", target_feature = "bmi2"))]
+#[inline]
+fn gather_flags(bits: u128, positions: u128) -> u128 {
+    use std::arch::x86_64::_pext_u64;
+    let low = positions as u64;
+    // The amd64 build enables BMI2.
+    let (first, last) = unsafe {
+        (
+            _pext_u64(bits as u64, low),
+            _pext_u64((bits >> 64) as u64, (positions >> 64) as u64),
+        )
+    };
+    u128::from(first) | (u128::from(last) << low.count_ones())
+}
+
+#[cfg(all(target_arch = "x86_64", target_feature = "bmi2"))]
+fn parse_masks<const N: usize>(line: &[u8], mut commas: u128, quotes: u128) -> Option<[&[u8]; N]> {
+    if commas.count_ones() as usize + 1 != N {
+        return None;
+    }
+
+    let mut quoted_fields = 0;
+    if quotes != 0 {
+        // A quote can only sit next to a separator or an end of the row.
+        // A one-byte quoted field would use the same byte twice.
+        let starts = (commas << 1) | 1;
+        let ends = (commas >> 1) | (1 << (line.len() - 1));
+        let opening = quotes & starts;
+        let closing = quotes & ends;
+        if opening | closing != quotes || opening & closing != 0 {
+            return None;
+        }
+
+        // Recover the field indices of each opening and closing quote. An
+        // empty first field has no closing position before its first comma.
+        quoted_fields = gather_flags(opening, starts);
+        let closing_fields = gather_flags(closing, ends) << (commas & 1);
+        if quoted_fields != closing_fields {
+            return None;
+        }
+    }
+
+    let mut output = [b"".as_slice(); N];
+    let mut start = 0;
+    for (index, field) in output.iter_mut().enumerate() {
+        let end = if index + 1 < N {
+            let comma = commas.trailing_zeros() as usize;
+            commas &= commas - 1;
+            comma
+        } else {
+            line.len()
+        };
+        let quoted = (quoted_fields & 1) as usize;
+        *field = &line[start + quoted..end - quoted];
+        start = end + 1;
+        quoted_fields >>= 1;
+    }
+    Some(output)
+}
+
+#[cfg(not(all(target_arch = "x86_64", target_feature = "bmi2")))]
 fn parse_masks<const N: usize>(
     line: &[u8],
     mut commas: u128,
@@ -148,6 +209,25 @@ mod tests {
                 assert_eq!(
                     fields::<3>(row.as_bytes()),
                     fields_scalar::<3>(row.as_bytes()),
+                    "{row:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn empty_fields_preserve_quote_positions() {
+        for len in 0..128 {
+            let padding = "a".repeat(len);
+            for row in [
+                format!(",\"{padding}\",,"),
+                format!(",\"{padding}\",\"\","),
+                format!("\"{padding}\",,\",last"),
+                format!(",{padding},\"broken,last\""),
+            ] {
+                assert_eq!(
+                    fields::<4>(row.as_bytes()),
+                    fields_scalar::<4>(row.as_bytes()),
                     "{row:?}"
                 );
             }

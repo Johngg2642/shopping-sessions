@@ -59,7 +59,8 @@ fn process(
             .then_with(|| a.time.cmp(&b.time))
             .then_with(|| b.id.cmp(a.id))
     });
-    clicks.dedup_by(|a, b| a.person == b.person && a.time == b.time && a.id == b.id);
+    // Identical clicks leave the latest eligible campaign and its merged
+    // coverage intervals unchanged, so attribution can consume them directly.
 
     let mut users = Users::new(path)?;
     let mut aggregator = Aggregator::new(&products.categories, campaigns.organic, layout);
