@@ -61,7 +61,7 @@ fn fields_from_masks<const N: usize>(line: &[u8]) -> Option<[&[u8]; N]> {
 
 #[cfg(all(target_arch = "x86_64", target_feature = "bmi2"))]
 #[inline]
-fn gather_flags(bits: u128, positions: u128) -> u128 {
+fn gather_flags(bits: u128, positions: u128) -> u64 {
     use std::arch::x86_64::_pext_u64;
     let low = positions as u64;
     // The amd64 build enables BMI2.
@@ -71,11 +71,14 @@ fn gather_flags(bits: u128, positions: u128) -> u128 {
             _pext_u64((bits >> 64) as u64, (positions >> 64) as u64),
         )
     };
-    u128::from(first) | (u128::from(last) << low.count_ones())
+    first | last.wrapping_shl(low.count_ones())
 }
 
 #[cfg(all(target_arch = "x86_64", target_feature = "bmi2"))]
 fn parse_masks<const N: usize>(line: &[u8], mut commas: u128, quotes: u128) -> Option<[&[u8]; N]> {
+    if N > 64 {
+        return parse_masks_scalar_flags(line, commas, quotes);
+    }
     if commas.count_ones() as usize + 1 != N {
         return None;
     }
@@ -120,7 +123,9 @@ fn parse_masks<const N: usize>(line: &[u8], mut commas: u128, quotes: u128) -> O
 }
 
 #[cfg(not(all(target_arch = "x86_64", target_feature = "bmi2")))]
-fn parse_masks<const N: usize>(
+use parse_masks_scalar_flags as parse_masks;
+
+fn parse_masks_scalar_flags<const N: usize>(
     line: &[u8],
     mut commas: u128,
     mut quotes: u128,

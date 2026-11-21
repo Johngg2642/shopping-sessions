@@ -13,15 +13,20 @@ pub struct LinkedIds {
 }
 
 struct Node<'a> {
-    parent: usize,
-    size: usize,
-    minimum: &'a [u8],
+    // Roots store the negative size of their component. Other nodes store a parent index.
+    parent_or_size: isize,
+    minimum: (&'a [u8], PersonKey),
 }
 
 fn root(nodes: &mut [Node<'_>], mut index: usize) -> usize {
-    while nodes[index].parent != index {
-        nodes[index].parent = nodes[nodes[index].parent].parent;
-        index = nodes[index].parent;
+    while nodes[index].parent_or_size >= 0 {
+        let parent = nodes[index].parent_or_size as usize;
+        let ancestor = nodes[parent].parent_or_size;
+        if ancestor < 0 {
+            return parent;
+        }
+        nodes[index].parent_or_size = ancestor;
+        index = ancestor as usize;
     }
     index
 }
@@ -39,12 +44,12 @@ impl LinkedIds {
                     continue;
                 }
                 let [mut a, mut b] = [left, right].map(|id| {
-                    let index = *ids.entry(people.key(id)).or_insert_with(|| {
+                    let key = people.key(id);
+                    let index = *ids.entry(key).or_insert_with(|| {
                         let index = nodes.len();
                         nodes.push(Node {
-                            parent: index,
-                            size: 1,
-                            minimum: id,
+                            parent_or_size: -1,
+                            minimum: (id, key),
                         });
                         index
                     });
@@ -53,11 +58,11 @@ impl LinkedIds {
                 if a == b {
                     continue;
                 }
-                if nodes[a].size < nodes[b].size {
+                if nodes[a].parent_or_size > nodes[b].parent_or_size {
                     std::mem::swap(&mut a, &mut b);
                 }
-                nodes[b].parent = a;
-                nodes[a].size += nodes[b].size;
+                nodes[a].parent_or_size += nodes[b].parent_or_size;
+                nodes[b].parent_or_size = a as isize;
                 nodes[a].minimum = nodes[a].minimum.min(nodes[b].minimum);
             }
         }
@@ -65,7 +70,7 @@ impl LinkedIds {
         let canonical: Vec<_> = (0..nodes.len())
             .map(|index| {
                 let index = root(&mut nodes, index);
-                people.key(nodes[index].minimum)
+                nodes[index].minimum.1
             })
             .collect();
         let mut representatives = Map::with_capacity_and_hasher(ids.len(), RandomState::new());
@@ -128,9 +133,26 @@ impl<'a> Products<'a> {
 }
 
 pub struct Campaigns<'a> {
-    pub codes: Map<&'a [u8], u32>,
+    codes: Map<&'a [u8], u32>,
+    numeric: Vec<u32>,
     pub labels: Vec<(&'a str, &'a str)>,
     pub organic: u32,
+}
+
+fn numeric_campaign(id: &[u8]) -> Option<usize> {
+    let digits = id.strip_prefix(b"c_")?;
+    if digits.is_empty() || digits.len() > 4 || (digits.len() > 1 && digits[0] == b'0') {
+        return None;
+    }
+    let mut number = 0;
+    for &byte in digits {
+        let digit = byte.wrapping_sub(b'0');
+        if digit > 9 {
+            return None;
+        }
+        number = number * 10 + usize::from(digit);
+    }
+    Some(number)
 }
 
 impl<'a> Campaigns<'a> {
@@ -138,8 +160,17 @@ impl<'a> Campaigns<'a> {
         let rows = dimension_rows(bytes)?;
         let mut labels = Vec::with_capacity(rows.len() + 1);
         let mut codes = Map::default();
+        let mut numeric = Vec::new();
         for [id, channel] in rows {
-            codes.insert(id, labels.len() as u32);
+            let code = labels.len() as u32;
+            if let Some(index) = numeric_campaign(id) {
+                if index >= numeric.len() {
+                    numeric.resize(index + 1, u32::MAX);
+                }
+                numeric[index] = code;
+            } else {
+                codes.insert(id, code);
+            }
             labels.push((
                 std::str::from_utf8(id).map_err(io::Error::other)?,
                 std::str::from_utf8(channel).map_err(io::Error::other)?,
@@ -149,8 +180,37 @@ impl<'a> Campaigns<'a> {
         labels.push(("organic", "organic"));
         Ok(Self {
             codes,
+            numeric,
             labels,
             organic,
         })
+    }
+
+    pub fn code(&self, id: &[u8]) -> Option<u32> {
+        if let Some(index) = numeric_campaign(id) {
+            self.numeric
+                .get(index)
+                .copied()
+                .filter(|&code| code != u32::MAX)
+        } else {
+            self.codes.get(id).copied()
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Campaigns;
+
+    #[test]
+    fn numeric_campaign_codes_preserve_exact_spelling() {
+        let campaigns =
+            Campaigns::new(b"campaign_id,channel\nc_1,email\nc_01,social\nc_12345,video\n")
+                .unwrap();
+        assert_eq!(campaigns.code(b"c_1"), Some(0));
+        assert_eq!(campaigns.code(b"c_01"), Some(1));
+        assert_eq!(campaigns.code(b"c_12345"), Some(2));
+        assert_eq!(campaigns.code(b"c_2"), None);
+        assert_eq!(campaigns.code(b"c_001"), None);
     }
 }

@@ -16,7 +16,7 @@ use std::time::Instant;
 use ahash::RandomState;
 use rayon::prelude::*;
 
-use crate::aggregate::{Aggregator, CampaignDays, CampaignLayout};
+use crate::aggregate::{Aggregator, CampaignDays, CampaignLayout, UserDay};
 use crate::clean::{Click, Event, EventDecoder, EventEncoder};
 use crate::dimensions::{Campaigns, LinkedIds, Products};
 use crate::input::{Input, WEEK, map_file, timestamp};
@@ -39,20 +39,16 @@ fn window(data: &Path) -> Result<Range<i64>, Error> {
     Ok(range)
 }
 
-fn process(
+fn process<'a>(
     mut events: Vec<Event>,
     mut clicks: Vec<Click<'_>>,
-    campaigns: &Campaigns<'_>,
-    products: &Products<'_>,
     interned: &[&[u8]],
-    layout: CampaignLayout,
     decoder: &EventDecoder,
-    path: &Path,
-) -> Result<CampaignDays, Error> {
+    users: &mut Users,
+    aggregator: &mut Aggregator<'a>,
+    rows: &mut Vec<UserDay<'a>>,
+) -> Result<(), Error> {
     events.sort_unstable_by_key(|event| event.person);
-    for person in events.chunk_by_mut(|a, b| a.person == b.person) {
-        decoder.sort_time(person);
-    }
     clicks.sort_unstable_by(|a, b| {
         a.person
             .cmp(&b.person)
@@ -62,12 +58,12 @@ fn process(
     // Identical clicks leave the latest eligible campaign and its merged
     // coverage intervals unchanged, so attribution can consume them directly.
 
-    let mut users = Users::new(path)?;
-    let mut aggregator = Aggregator::new(&products.categories, campaigns.organic, layout);
-    let mut rows = Vec::with_capacity(8192);
     let mut click_groups = clicks.chunk_by(|a, b| a.person == b.person).peekable();
 
-    for events in events.chunk_by(|a, b| a.person == b.person) {
+    for events in events.chunk_by_mut(|a, b| a.person == b.person) {
+        if events.len() > 1 {
+            decoder.sort_time(events);
+        }
         let person = events[0].person;
         while click_groups
             .peek()
@@ -83,18 +79,14 @@ fn process(
         } else {
             &[]
         };
-        aggregator.person(person, events, clicks, decoder, &mut rows);
+        aggregator.person(person, events, clicks, decoder, rows);
         if rows.len() >= 8192 {
-            users.write(&rows, interned)?;
+            users.write(rows, interned)?;
             rows.clear();
         }
     }
 
-    if !rows.is_empty() {
-        users.write(&rows, interned)?;
-    }
-    users.finish()?;
-    Ok(aggregator.campaigns)
+    Ok(())
 }
 
 fn run(data: &Path, out: &Path) -> Result<(), Error> {
@@ -160,22 +152,39 @@ fn run(data: &Path, out: &Path) -> Result<(), Error> {
     }
 
     let layout = CampaignLayout::new(window.start, window.end, campaigns.labels.len());
+    // Give each task enough shards to reuse its writer and campaign totals.
     let totals = events
         .into_par_iter()
         .zip(clicks)
         .enumerate()
-        .filter(|(_, (events, _))| !events.is_empty())
-        .map(|(part, (events, clicks))| {
-            process(
-                events,
-                clicks,
-                &campaigns,
-                &products,
-                &interned,
-                layout,
-                &decoder,
-                &user_dir.join(format!("part-{part:03}.parquet")),
-            )
+        .with_min_len(4)
+        .try_fold(
+            || None,
+            |mut workspace, (part, (events, clicks))| {
+                if !events.is_empty() {
+                    if workspace.is_none() {
+                        workspace = Some((
+                            Aggregator::new(&products.categories, campaigns.organic, layout),
+                            Vec::with_capacity(8192),
+                            Users::new(&user_dir.join(format!("part-{part:03}.parquet")))?,
+                        ));
+                    }
+                    let (aggregator, rows, users) =
+                        workspace.as_mut().expect("active output group");
+                    process(events, clicks, &interned, &decoder, users, aggregator, rows)?;
+                }
+                Ok::<_, Error>(workspace)
+            },
+        )
+        .filter_map(|workspace| {
+            workspace.transpose().map(|result| {
+                let (aggregator, rows, mut users) = result?;
+                if !rows.is_empty() {
+                    users.write(&rows, &interned)?;
+                }
+                users.finish()?;
+                Ok::<_, Error>(aggregator.campaigns)
+            })
         })
         .try_reduce_with(|left, right| Ok(left.merge(right)))
         .transpose()?

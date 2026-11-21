@@ -96,6 +96,14 @@ impl PersonKey {
         if bits & INTERNED != 0 {
             return std::str::from_utf8(interned[(bits ^ INTERNED) as usize]);
         }
+        #[cfg(all(target_arch = "x86_64", target_feature = "bmi2"))]
+        if bits >= 1 << 56 {
+            // Expand the eight low ASCII lanes in one instruction. The ninth is already aligned.
+            let expanded = unsafe { std::arch::x86_64::_pdep_u64(bits, 0x7f7f_7f7f_7f7f_7f7f) };
+            buffer[0] = (bits >> 56) as u8;
+            buffer[1..].copy_from_slice(&expanded.to_be_bytes());
+            return std::str::from_utf8(buffer);
+        }
         let mut start = buffer.len();
         while bits != 0 {
             start -= 1;
