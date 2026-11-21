@@ -17,7 +17,7 @@ use ahash::RandomState;
 use rayon::prelude::*;
 
 use crate::aggregate::{Aggregator, CampaignDays, CampaignLayout};
-use crate::clean::{Click, Event, Repeats};
+use crate::clean::{Click, Event, EventDecoder, EventEncoder};
 use crate::dimensions::{Campaigns, LinkedIds, Products};
 use crate::input::{Input, WEEK, map_file, timestamp};
 use crate::output::{Error, Users};
@@ -46,11 +46,12 @@ fn process(
     products: &Products<'_>,
     interned: &[&[u8]],
     layout: CampaignLayout,
+    decoder: &EventDecoder,
     path: &Path,
 ) -> Result<CampaignDays, Error> {
     events.sort_unstable_by_key(|event| event.person);
     for person in events.chunk_by_mut(|a, b| a.person == b.person) {
-        person.sort_unstable_by_key(|event| event.time);
+        decoder.sort_time(person);
     }
     clicks.sort_unstable_by(|a, b| {
         a.person
@@ -81,7 +82,7 @@ fn process(
         } else {
             &[]
         };
-        aggregator.person(person, events, clicks, &mut rows);
+        aggregator.person(person, events, clicks, decoder, &mut rows);
         if rows.len() >= 8192 {
             users.write(&rows, interned)?;
             rows.clear();
@@ -117,23 +118,23 @@ fn run(data: &Path, out: &Path) -> Result<(), Error> {
     let event_input = Input::open(&data.join("events"))?;
     let click_input = Input::open(&data.join("clicks"))?;
     let identities = People::default();
-    let (linked_ids, repeats) = rayon::join(
+    let encoder = EventEncoder::new(window.start);
+    let (linked_ids, candidates) = rayon::join(
         || LinkedIds::new(&links, &identities),
-        || Repeats::new(&event_input, &hashes),
-    );
-    elapsed("dimensions, linked IDs, and repeat screening");
-    let (events, clicks) = rayon::join(
         || {
-            clean::events(
+            clean::event_candidates(
                 &event_input,
-                &linked_ids,
                 &products,
                 &identities,
                 window.clone(),
                 &hashes,
-                &repeats,
+                &encoder,
             )
         },
+    );
+    elapsed("dimensions, linked IDs, and parse events");
+    let (events, clicks) = rayon::join(
+        || candidates.into_events(&linked_ids, &hashes),
         || {
             clean::clicks(
                 &click_input,
@@ -146,7 +147,8 @@ fn run(data: &Path, out: &Path) -> Result<(), Error> {
         },
     );
     let interned = identities.into_names();
-    elapsed("parse and deduplicate events and clicks");
+    let decoder = encoder.finish();
+    elapsed("deduplicate events and parse clicks");
 
     let user_dir = out.join("user_daily");
     let campaign_dir = out.join("campaign_daily");
@@ -170,6 +172,7 @@ fn run(data: &Path, out: &Path) -> Result<(), Error> {
                 &products,
                 &interned,
                 layout,
+                &decoder,
                 &user_dir.join(format!("part-{part:03}.parquet")),
             )
         })

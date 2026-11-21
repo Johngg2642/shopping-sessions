@@ -1,4 +1,4 @@
-use crate::clean::{Click, Event};
+use crate::clean::{Click, Event, EventDecoder};
 use crate::dimensions::Map;
 use crate::input::{DAY, WEEK};
 use crate::person::PersonKey;
@@ -180,11 +180,12 @@ impl<'a> Aggregator<'a> {
         person: PersonKey,
         events: &[Event],
         clicks: &[Click<'_>],
+        decoder: &EventDecoder,
         output: &mut Vec<UserDay<'a>>,
     ) {
         self.sessions.clear();
         let mut session = Session {
-            start: events[0].time,
+            start: decoder.unpack(&events[0]).time,
             revenue: 0,
         };
         let mut previous_time = session.start;
@@ -195,6 +196,7 @@ impl<'a> Aggregator<'a> {
         };
 
         for event in events {
+            let event = decoder.unpack(event);
             if event.time - previous_time > SESSION_GAP {
                 self.sessions.push(session);
                 session = Session {

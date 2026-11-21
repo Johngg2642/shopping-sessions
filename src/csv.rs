@@ -56,6 +56,14 @@ fn fields_from_masks<const N: usize>(line: &[u8]) -> Option<[&[u8]; N]> {
         commas |= u128::from(separators) << offset;
         quotes |= u128::from(marks) << offset;
     }
+    parse_masks(line, commas, quotes)
+}
+
+fn parse_masks<const N: usize>(
+    line: &[u8],
+    mut commas: u128,
+    mut quotes: u128,
+) -> Option<[&[u8]; N]> {
     if commas.count_ones() as usize + 1 != N {
         return None;
     }
@@ -70,15 +78,11 @@ fn fields_from_masks<const N: usize>(line: &[u8]) -> Option<[&[u8]; N]> {
         } else {
             line.len()
         };
-        *field = if start < end && (quotes >> start) & 1 != 0 {
-            if end - start < 2 {
-                return None;
-            }
-            quotes ^= (1 << start) | (1 << (end - 1));
-            &line[start + 1..end - 1]
-        } else {
-            &line[start..end]
-        };
+        let opening = 1u128.wrapping_shl(start as u32);
+        let closing = 1u128.wrapping_shl(end.wrapping_sub(1) as u32);
+        let quoted = ((start < 128) & (quotes & opening != 0)) as usize;
+        quotes ^= (opening | closing) * quoted as u128;
+        *field = line.get(start + quoted..end.wrapping_sub(quoted))?;
         start = end + 1;
     }
     // Every quote must be part of a matched opening and closing pair.
@@ -149,4 +153,165 @@ mod tests {
             }
         }
     }
+
+    #[test]
+    fn chunk_scanner_matches_scalar_across_block_boundaries() {
+        let mut bytes = Vec::new();
+        for len in 0..150 {
+            let value = "x".repeat(len);
+            bytes.extend_from_slice(format!("\"{value}\",,ok\n{value},x,,extra\n").as_bytes());
+            bytes.extend_from_slice(format!("{value},,\"bad\"\r\n{value},x,\n").as_bytes());
+        }
+        bytes.extend_from_slice(b"last,unfinished,row");
+
+        let expected: Vec<_> = bytes
+            .split(|&byte| byte == b'\n')
+            .filter_map(fields_scalar::<3>)
+            .collect();
+        let mut actual = Vec::new();
+        records::<3>(&bytes, |row| actual.push(row));
+        assert_eq!(actual, expected);
+    }
+}
+
+#[derive(Clone, Copy, Default)]
+struct Block {
+    newlines: u64,
+    commas: u64,
+    quotes: u64,
+}
+
+pub fn records<'a, const N: usize>(bytes: &'a [u8], mut visit: impl FnMut([&'a [u8]; N])) {
+    #[cfg(target_arch = "x86_64")]
+    if std::arch::is_x86_feature_detected!("avx512bw") {
+        // The detection check covers every call for this slice.
+        return records_block(bytes, |block| unsafe { block_avx512(block) }, visit);
+    }
+    #[cfg(any(
+        target_arch = "aarch64",
+        all(target_arch = "x86_64", target_feature = "avx2")
+    ))]
+    if bytes.len() >= 256 {
+        return records_block(bytes, block_native, visit);
+    }
+    for line in bytes.split(|&b| b == b'\n') {
+        if let Some(values) = fields(line) {
+            visit(values);
+        }
+    }
+}
+
+#[inline]
+fn records_block<'a, const N: usize>(
+    bytes: &'a [u8],
+    classify: impl Fn(&[u8; 64]) -> Block,
+    mut visit: impl FnMut([&'a [u8]; N]),
+) {
+    let mut start = 0;
+    let mut commas = 0;
+    let mut quotes = 0;
+    for (index, block) in bytes.as_chunks::<64>().0.iter().enumerate() {
+        let base = index * 64;
+        let end_block = base + 64;
+        let Block {
+            mut newlines,
+            commas: sep,
+            quotes: mark,
+        } = classify(block);
+        while newlines != 0 {
+            let end = base + newlines.trailing_zeros() as usize;
+            newlines &= newlines - 1;
+            let line = &bytes[start..end];
+            if line.len() <= 128 && !line.is_empty() {
+                let mask = u128::MAX >> (128 - line.len());
+                let offset = base.saturating_sub(start);
+                if offset < 128 {
+                    let skip = start.saturating_sub(base);
+                    commas |= u128::from(sep >> skip) << offset;
+                    quotes |= u128::from(mark >> skip) << offset;
+                }
+                if let Some(values) = parse_masks(line, commas & mask, quotes & mask) {
+                    visit(values);
+                }
+            } else if line.len() > 128 {
+                if let Some(values) = fields_scalar(line) {
+                    visit(values);
+                }
+            }
+            start = end + 1;
+            commas = 0;
+            quotes = 0;
+        }
+        if start < end_block && end_block - start <= 128 {
+            let offset = base.saturating_sub(start);
+            let skip = start.saturating_sub(base);
+            commas |= u128::from(sep >> skip) << offset;
+            quotes |= u128::from(mark >> skip) << offset;
+        }
+    }
+    for line in bytes[start..].split(|&b| b == b'\n') {
+        if let Some(values) = fields(line) {
+            visit(values);
+        }
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512bw")]
+unsafe fn block_avx512(bytes: &[u8; 64]) -> Block {
+    use std::arch::x86_64::*;
+    // The full block is readable and the load allows an unaligned address.
+    let data = unsafe { _mm512_loadu_si512(bytes.as_ptr().cast()) };
+    Block {
+        newlines: _mm512_cmpeq_epi8_mask(data, _mm512_set1_epi8(b'\n' as i8)),
+        commas: _mm512_cmpeq_epi8_mask(data, _mm512_set1_epi8(b',' as i8)),
+        quotes: _mm512_cmpeq_epi8_mask(data, _mm512_set1_epi8(b'"' as i8)),
+    }
+}
+
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+#[inline]
+fn block_native(bytes: &[u8; 64]) -> Block {
+    use std::arch::x86_64::*;
+    // Both loads stay within the full block and allow unaligned addresses.
+    unsafe {
+        let lo = _mm256_loadu_si256(bytes.as_ptr().cast());
+        let hi = _mm256_loadu_si256(bytes.as_ptr().add(32).cast());
+        let mask = |byte| {
+            let byte = _mm256_set1_epi8(byte);
+            let lo = _mm256_movemask_epi8(_mm256_cmpeq_epi8(lo, byte)) as u32;
+            let hi = _mm256_movemask_epi8(_mm256_cmpeq_epi8(hi, byte)) as u32;
+            u64::from(lo) | (u64::from(hi) << 32)
+        };
+        Block {
+            newlines: mask(b'\n' as i8),
+            commas: mask(b',' as i8),
+            quotes: mask(b'"' as i8),
+        }
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline]
+fn block_native(bytes: &[u8; 64]) -> Block {
+    use std::arch::aarch64::*;
+    const WEIGHTS: [u8; 16] = [1, 2, 4, 8, 16, 32, 64, 128, 1, 2, 4, 8, 16, 32, 64, 128];
+    let mut masks = Block::default();
+    // All vectors are fully inside their arrays and NEON is baseline on AArch64.
+    unsafe {
+        let weights = vld1q_u8(WEIGHTS.as_ptr());
+        for (i, vector) in bytes.as_chunks::<16>().0.iter().enumerate() {
+            let value = vld1q_u8(vector.as_ptr());
+            let mask = |byte| {
+                let bits = vandq_u8(vceqq_u8(value, vdupq_n_u8(byte)), weights);
+                let lo = vaddv_u8(vget_low_u8(bits));
+                let hi = vaddv_u8(vget_high_u8(bits));
+                (u64::from(lo) | (u64::from(hi) << 8)) << (i * 16)
+            };
+            masks.newlines |= mask(b'\n');
+            masks.commas |= mask(b',');
+            masks.quotes |= mask(b'"');
+        }
+    }
+    masks
 }

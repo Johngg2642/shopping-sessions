@@ -1,3 +1,4 @@
+use std::num::NonZeroU64;
 use std::str::Utf8Error;
 use std::sync::Mutex;
 
@@ -49,7 +50,7 @@ fn pack_seven_bit_lanes(bytes: u64) -> u64 {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct PersonKey(u64);
+pub struct PersonKey(NonZeroU64);
 
 #[derive(Default)]
 pub struct People<'a>(Mutex<Interned<'a>>);
@@ -64,14 +65,17 @@ impl<'a> People<'a> {
     pub fn key(&self, name: &'a [u8]) -> PersonKey {
         // Nine nonzero ASCII bytes fit in 63 bits. Encode them without a
         // string lookup during sort, and intern all other UTF-8 names exactly.
-        inline_ascii(name).map_or_else(|| self.intern(name), PersonKey)
+        inline_ascii(name)
+            .and_then(NonZeroU64::new)
+            .map_or_else(|| self.intern(name), PersonKey)
     }
 
     fn intern(&self, name: &'a [u8]) -> PersonKey {
         let mut storage = self.0.lock().expect("person dictionary lock");
         let Interned { codes, names } = &mut *storage;
         *codes.entry(name).or_insert_with(|| {
-            let key = PersonKey(INTERNED | names.len() as u64);
+            let key =
+                PersonKey(NonZeroU64::new(INTERNED | names.len() as u64).expect("interned key"));
             names.push(name);
             key
         })
@@ -88,10 +92,10 @@ impl PersonKey {
         interned: &'a [&'a [u8]],
         buffer: &'a mut [u8; 9],
     ) -> Result<&'a str, Utf8Error> {
-        if self.0 & INTERNED != 0 {
-            return std::str::from_utf8(interned[(self.0 ^ INTERNED) as usize]);
+        let mut bits = self.0.get();
+        if bits & INTERNED != 0 {
+            return std::str::from_utf8(interned[(bits ^ INTERNED) as usize]);
         }
-        let mut bits = self.0;
         let mut start = buffer.len();
         while bits != 0 {
             start -= 1;

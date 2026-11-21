@@ -64,8 +64,12 @@ impl Input {
         Ok(Self { files, chunks })
     }
 
+    pub fn chunk_bytes(&self, chunk: &Chunk) -> &[u8] {
+        &self.files[chunk.file][chunk.start..chunk.end]
+    }
+
     pub fn rows<'a>(&'a self, chunk: &'a Chunk) -> impl Iterator<Item = &'a [u8]> {
-        self.files[chunk.file][chunk.start..chunk.end].split_terminator_byte(b'\n')
+        self.chunk_bytes(chunk).split_terminator_byte(b'\n')
     }
 
     pub fn bytes(&self) -> usize {
@@ -98,18 +102,6 @@ impl SplitByte for [u8] {
     }
 }
 
-// A malformed row can add a false positive here. Valid IDs use the same
-// unquoted bytes during the full parse, so no actual repeat is missed.
-pub fn first_id(line: &[u8]) -> Option<&[u8]> {
-    let first = &line[..memchr(b',', line)?];
-    let id = if let Some(quoted) = first.strip_prefix(b"\"") {
-        quoted.strip_suffix(b"\"")?
-    } else {
-        first
-    };
-    (!id.is_empty()).then_some(id)
-}
-
 pub fn decimal(mut bytes: &[u8], max: i64) -> Option<i64> {
     if bytes.is_empty() {
         return None;
@@ -137,17 +129,26 @@ pub fn decimal(mut bytes: &[u8], max: i64) -> Option<i64> {
 
 #[inline]
 fn decimal_eight(bytes: &[u8; 8]) -> Option<u64> {
-    const HIGH: u64 = 0xf0f0_f0f0_f0f0_f0f0;
-    const ASCII: u64 = 0x3030_3030_3030_3030;
     let bytes = u64::from_le_bytes(*bytes);
-    if bytes & HIGH != ASCII || (bytes + 0x0606_0606_0606_0606) & HIGH != ASCII {
+    if !eight_ascii_digits(bytes) {
         return None;
     }
-    // Reduce eight validated ASCII digits to four pairs, two quads, then one value.
-    let digits = bytes & !HIGH;
-    let pairs = (digits.wrapping_mul(10) + (digits >> 8)) & 0x00ff_00ff_00ff_00ff;
+    let pairs = digit_pairs(bytes);
     let quads = (pairs.wrapping_mul(100) + (pairs >> 16)) & 0x0000_ffff_0000_ffff;
     Some((quads.wrapping_mul(10_000) + (quads >> 32)) & 0xffff_ffff)
+}
+
+#[inline]
+fn eight_ascii_digits(bytes: u64) -> bool {
+    const HIGH: u64 = 0xf0f0_f0f0_f0f0_f0f0;
+    const ASCII: u64 = 0x3030_3030_3030_3030;
+    bytes & HIGH == ASCII && (bytes + 0x0606_0606_0606_0606) & HIGH == ASCII
+}
+
+#[inline]
+fn digit_pairs(bytes: u64) -> u64 {
+    let digits = bytes & 0x0f0f_0f0f_0f0f_0f0f;
+    (digits.wrapping_mul(10) + (digits >> 8)) & 0x00ff_00ff_00ff_00ff
 }
 
 fn pair(bytes: &[u8], start: usize) -> Option<i64> {
@@ -177,30 +178,55 @@ pub fn timestamp(bytes: &[u8]) -> Option<i64> {
         }
         _ => return None,
     };
-    if bytes[7] != b'-' || bytes[10] != b'T' || bytes[13] != b':' || bytes[16] != b':' {
-        return None;
-    }
-    let year = pair(bytes, 0)? * 100 + pair(bytes, 2)?;
-    let (month, day) = (pair(bytes, 5)?, pair(bytes, 8)?);
-    let (hour, minute, second) = (pair(bytes, 11)?, pair(bytes, 14)?, pair(bytes, 17)?);
-    if !(1..=12).contains(&month) || day == 0 || hour > 23 || minute > 59 || second > 59 {
-        return None;
-    }
-    let entry = calendar_month(year, month);
-    if day > i64::from(entry & 31) {
-        return None;
-    }
-    let days = i64::from(entry >> 5) + day - 1;
-    Some(days * DAY + ((hour * 60 + minute - offset_minutes) * 60 + second) * 1_000)
+    let stamp = bytes.first_chunk::<20>().expect("ISO timestamp width");
+    Some(civil_millis::<true>(stamp)? - offset_minutes * 60_000)
 }
 
 pub fn ingest_millis(bytes: &[u8]) -> i64 {
     // The spec guarantees every ingest field is a valid fixed-width UTC timestamp.
     let bytes: &[u8; 20] = bytes.try_into().expect("fixed-width ingest timestamp");
-    let pair = |i: usize| i64::from(bytes[i] - b'0') * 10 + i64::from(bytes[i + 1] - b'0');
-    let month = calendar_month(pair(0) * 100 + pair(2), pair(5));
-    let days = i64::from(month >> 5) + pair(8) - 1;
-    days * DAY + ((pair(11) * 60 + pair(14)) * 60 + pair(17)) * 1_000
+    civil_millis::<false>(bytes).expect("valid ingest timestamp")
+}
+
+#[inline]
+fn civil_millis<const CHECK: bool>(bytes: &[u8; 20]) -> Option<i64> {
+    let date = u64::from_le_bytes(bytes[..8].try_into().expect("eight date bytes"));
+    let clock = u64::from_le_bytes(bytes[11..19].try_into().expect("eight time bytes"));
+    if CHECK
+        && (date & 0xff00_00ff_0000_0000 != 0x2d00_002d_0000_0000
+            || bytes[10] != b'T'
+            || clock & 0x0000_ff00_00ff_0000 != 0x0000_3a00_003a_0000)
+    {
+        return None;
+    }
+
+    // Gather the fixed-width ASCII digits into two eight-byte words.
+    let day = u64::from(u16::from_le_bytes([bytes[8], bytes[9]]));
+    let date = (date & 0xffff_ffff) | ((date >> 8) & 0x0000_ffff_0000_0000) | (day << 48);
+    let clock = (clock & 0xffff)
+        | ((clock >> 8) & 0x0000_0000_ffff_0000)
+        | ((clock >> 16) & 0x0000_ffff_0000_0000)
+        | 0x3030_0000_0000_0000;
+    if CHECK && !(eight_ascii_digits(date) && eight_ascii_digits(clock)) {
+        return None;
+    }
+
+    let date = digit_pairs(date);
+    let clock = digit_pairs(clock);
+    let value = |pairs, shift| ((pairs >> shift) & 0xffu64) as i64;
+    let year = value(date, 0) * 100 + value(date, 16);
+    let (month, day) = (value(date, 32), value(date, 48));
+    let (hour, minute, second) = (value(clock, 0), value(clock, 16), value(clock, 32));
+    if CHECK && (!(1..=12).contains(&month) || day == 0 || hour > 23 || minute > 59 || second > 59)
+    {
+        return None;
+    }
+    let entry = calendar_month(year, month);
+    if CHECK && day > i64::from(entry & 31) {
+        return None;
+    }
+    let days = i64::from(entry >> 5) + day - 1;
+    Some(days * DAY + ((hour * 60 + minute) * 60 + second) * 1_000)
 }
 
 const FIRST_CACHED_YEAR: i64 = 1970;
