@@ -8,6 +8,7 @@ use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use parquet::arrow::ArrowWriter;
 use parquet::basic::Compression;
 use parquet::file::properties::WriterProperties;
+use parquet::schema::types::ColumnPath;
 
 use crate::aggregate::{CampaignDays, UserDay};
 
@@ -19,9 +20,12 @@ struct Table {
 
 impl Table {
     fn new(path: &Path, fields: Vec<Field>) -> Result<Self, Error> {
-        let properties = WriterProperties::builder()
-            .set_compression(Compression::SNAPPY)
-            .build();
+        let mut properties = WriterProperties::builder().set_compression(Compression::SNAPPY);
+        if fields[0].name() == "user_id" {
+            properties =
+                properties.set_column_dictionary_enabled(ColumnPath::from("user_id"), false);
+        }
+        let properties = properties.build();
         let schema = Arc::new(Schema::new(fields));
         let file = File::create(path)?;
         let writer = ArrowWriter::try_new(file, schema.clone(), Some(properties))?;
@@ -96,7 +100,7 @@ pub fn campaigns(path: &Path, rows: CampaignDays, labels: &[(&str, &str)]) -> Re
             Field::new("assisted_sessions", Int64, false),
         ],
     )?;
-    let rows: Vec<_> = rows.into_iter().collect();
+    let rows = rows.into_rows();
     let columns: Vec<ArrayRef> = vec![
         Arc::new(StringArray::from_iter_values(
             rows.iter().map(|((c, _), _)| labels[*c as usize].0),

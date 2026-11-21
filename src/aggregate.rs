@@ -5,7 +5,7 @@ use crate::person::PersonKey;
 
 const SESSION_GAP: i64 = 30 * 60 * 1_000;
 
-#[derive(Default)]
+#[derive(Clone, Copy, Default)]
 pub struct CampaignDay {
     pub sessions: i64,
     pub purchasing_sessions: i64,
@@ -14,7 +14,7 @@ pub struct CampaignDay {
 }
 
 impl CampaignDay {
-    pub fn merge(&mut self, other: Self) {
+    fn merge(&mut self, other: Self) {
         self.sessions += other.sessions;
         self.purchasing_sessions += other.purchasing_sessions;
         self.revenue += other.revenue;
@@ -22,7 +22,102 @@ impl CampaignDay {
     }
 }
 
-pub type CampaignDays = Map<(u32, i32), CampaignDay>;
+#[derive(Clone, Copy)]
+pub struct CampaignLayout {
+    first: i32,
+    width: usize,
+    cells: usize,
+}
+
+impl CampaignLayout {
+    pub fn new(start: i64, end: i64, width: usize) -> Self {
+        let first = utc_day(start);
+        let days = (i64::from(utc_day(end - 1)) - i64::from(first) + 1) as usize;
+        // Bound the allocation for wider manifests or campaign lists.
+        let cells = days
+            .checked_mul(width)
+            .filter(|&n| n <= 65_536)
+            .unwrap_or(0);
+        Self {
+            first,
+            width,
+            cells,
+        }
+    }
+}
+
+pub enum CampaignDays {
+    Dense {
+        start: i32,
+        width: usize,
+        cells: Vec<CampaignDay>,
+    },
+    Sparse(Map<(u32, i32), CampaignDay>),
+}
+
+impl CampaignDays {
+    pub fn new(layout: CampaignLayout) -> Self {
+        if layout.cells == 0 {
+            Self::Sparse(Map::default())
+        } else {
+            Self::Dense {
+                start: layout.first,
+                width: layout.width,
+                cells: vec![CampaignDay::default(); layout.cells],
+            }
+        }
+    }
+
+    #[inline]
+    fn get_mut(&mut self, campaign: u32, day: i32) -> &mut CampaignDay {
+        match self {
+            Self::Dense {
+                start,
+                width,
+                cells,
+            } => &mut cells[(day - *start) as usize * *width + campaign as usize],
+            Self::Sparse(cells) => cells.entry((campaign, day)).or_default(),
+        }
+    }
+
+    pub fn merge(mut self, other: Self) -> Self {
+        match (&mut self, other) {
+            (Self::Dense { cells, .. }, Self::Dense { cells: other, .. }) => {
+                for (left, right) in cells.iter_mut().zip(other) {
+                    left.merge(right);
+                }
+            }
+            (Self::Sparse(cells), Self::Sparse(other)) => {
+                for (key, value) in other {
+                    cells.entry(key).or_default().merge(value);
+                }
+            }
+            _ => unreachable!("all shards use the same campaign layout"),
+        }
+        self
+    }
+
+    pub fn into_rows(self) -> Vec<((u32, i32), CampaignDay)> {
+        match self {
+            Self::Dense {
+                start,
+                width,
+                cells,
+            } => cells
+                .into_iter()
+                .enumerate()
+                .filter(|(_, value)| value.sessions != 0 || value.assists != 0)
+                .map(|(index, value)| {
+                    (
+                        ((index % width) as u32, start + (index / width) as i32),
+                        value,
+                    )
+                })
+                .collect(),
+            Self::Sparse(cells) => cells.into_iter().collect(),
+        }
+    }
+}
 
 pub struct UserDay<'a> {
     pub person: PersonKey,
@@ -67,9 +162,9 @@ fn utc_day(time: i64) -> i32 {
 }
 
 impl<'a> Aggregator<'a> {
-    pub fn new(categories: &'a [&'a str], organic: u32) -> Self {
+    pub fn new(categories: &'a [&'a str], organic: u32, layout: CampaignLayout) -> Self {
         Self {
-            campaigns: CampaignDays::default(),
+            campaigns: CampaignDays::new(layout),
             sessions: Vec::new(),
             categories,
             category_revenue: vec![0; categories.len()],
@@ -193,10 +288,7 @@ impl<'a> Aggregator<'a> {
                 .map(|index| &clicks[index])
                 .filter(|click| click.time >= session.start - WEEK)
                 .map_or(self.organic, |click| click.campaign);
-            let totals = self
-                .campaigns
-                .entry((campaign, utc_day(session.start)))
-                .or_default();
+            let totals = self.campaigns.get_mut(campaign, utc_day(session.start));
             totals.sessions += 1;
             totals.purchasing_sessions += i64::from(session.revenue > 0);
             totals.revenue += session.revenue;
@@ -225,7 +317,7 @@ fn add_assists(sessions: &[Session], totals: &mut CampaignDays, campaign: u32, c
         } else {
             covered.partition_point(|session| session.start < end_of_day)
         };
-        totals.entry((campaign, day)).or_default().assists += count as i64;
+        totals.get_mut(campaign, day).assists += count as i64;
         covered = &covered[count..];
     }
 }

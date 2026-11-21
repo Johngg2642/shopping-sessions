@@ -1,5 +1,6 @@
 use std::ops::Range;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 
 use ahash::RandomState;
 use hashbrown::HashTable;
@@ -7,13 +8,13 @@ use hashbrown::hash_table::Entry;
 use rayon::prelude::*;
 
 use crate::dimensions::{Campaigns, LinkedIds, Products};
-use crate::input::{DAY, Input, Position, decimal, fields, id, timestamp};
+use crate::input::{DAY, Input, decimal, fields, first_id, ingest_millis, timestamp};
 
 use crate::person::{People, PersonKey, inline_ascii};
 
 const SHARDS: usize = 128;
-const HASHED_ID: u64 = 1 << 63;
 
+#[derive(Clone, Copy)]
 pub struct Event {
     pub person: PersonKey,
     pub time: i64,
@@ -29,10 +30,50 @@ pub struct Click<'a> {
 }
 
 #[derive(Clone, Copy)]
-struct Candidate {
+struct Candidate<'a> {
     key: u64,
-    position: Position,
-    priority: u64,
+    long_id: Option<&'a [u8]>,
+    priority: i64,
+    event: Option<Event>,
+}
+
+pub struct Repeats(Vec<AtomicU64>);
+
+impl Repeats {
+    pub fn new(input: &Input, hashes: &RandomState) -> Self {
+        // Each bucket has a seen bit and a repeated bit. Byte size only
+        // determines the collision rate; collisions cause extra comparisons.
+        let words = (input.bytes() / 384)
+            .next_power_of_two()
+            .clamp(1024, 1 << 24);
+        let repeats = Self((0..words).map(|_| AtomicU64::new(0)).collect());
+        input.chunks.par_iter().for_each(|chunk| {
+            for row in input.rows(chunk) {
+                if let Some(id) = first_id(row) {
+                    repeats.observe(hashes.hash_one(id));
+                }
+            }
+        });
+        repeats
+    }
+
+    #[inline]
+    fn bucket(&self, hash: u64) -> (&AtomicU64, u64) {
+        let word = (hash >> 5) as usize & (self.0.len() - 1);
+        (&self.0[word], 1 << (hash & 31))
+    }
+
+    fn observe(&self, hash: u64) {
+        let (word, bit) = self.bucket(hash);
+        if word.fetch_or(bit, Relaxed) & bit != 0 {
+            word.fetch_or(bit << 32, Relaxed);
+        }
+    }
+
+    fn might_repeat(&self, hash: u64) -> bool {
+        let (word, bit) = self.bucket(hash);
+        word.load(Relaxed) & (bit << 32) != 0
+    }
 }
 
 struct Shards<T>([Mutex<Vec<T>>; SHARDS]);
@@ -60,103 +101,19 @@ fn shard(hash: u64) -> usize {
     (hash >> 32) as usize & (SHARDS - 1)
 }
 
-fn ingest_priority(timestamp: &[u8]) -> u64 {
-    // Ingest is always a valid, fixed-width UTC timestamp. Pack successive
-    // digit pairs to keep byte order chronological without touching the CSV
-    // again when choosing a winner later.
-    let timestamp: &[u8; 20] = timestamp.try_into().expect("fixed-width ingest timestamp");
-    let pair = |i: usize| (timestamp[i] - b'0') * 10 + (timestamp[i + 1] - b'0');
-    u64::from_be_bytes([
-        pair(0),
-        pair(2),
-        pair(5),
-        pair(8),
-        pair(11),
-        pair(14),
-        pair(17),
-        0,
-    ])
-}
-
-fn duplicate_events(input: &Input, hashes: &RandomState) -> Vec<Position> {
-    let candidates = Shards::new();
-    input.chunks.par_iter().for_each_init(
-        || std::array::from_fn(|_| Vec::new()),
-        |local, chunk| {
-            for (position, row) in input.rows(chunk) {
-                let Some(values) = fields::<7>(row) else {
-                    continue;
-                };
-                if values[0].is_empty() {
-                    continue;
-                }
-                let key = inline_ascii(values[0])
-                    .unwrap_or_else(|| hashes.hash_one(values[0]) | HASHED_ID);
-                local[shard(hashes.hash_one(key))].push(Candidate {
-                    key,
-                    position,
-                    priority: ingest_priority(values[3]),
-                });
-            }
-            candidates.append(local);
-        },
-    );
-
-    // Keep only losing positions. Winners can then be parsed in file order,
-    // avoiding a random read of the mapped data for every surviving row.
-    let mut rejected: Vec<_> = candidates
-        .into_vecs()
-        .into_par_iter()
-        .flat_map_iter(|candidates| {
-            let mut rejected = Vec::new();
-            let mut unique = HashTable::<Candidate>::with_capacity(candidates.len());
-            for candidate in candidates {
-                let mut first_id = None;
-                let entry = unique.entry(
-                    hashes.hash_one(candidate.key),
-                    |existing| {
-                        existing.key == candidate.key
-                            && (candidate.key & HASHED_ID == 0
-                                || id(input.row(existing.position))
-                                    == *first_id
-                                        .get_or_insert_with(|| id(input.row(candidate.position))))
-                    },
-                    |existing| hashes.hash_one(existing.key),
-                );
-                match entry {
-                    Entry::Vacant(entry) => {
-                        entry.insert(candidate);
-                    }
-                    Entry::Occupied(mut entry) => {
-                        if candidate.priority < entry.get().priority {
-                            rejected.push(entry.get().position);
-                            *entry.get_mut() = candidate;
-                        } else {
-                            rejected.push(candidate.position);
-                        }
-                    }
-                }
-            }
-            rejected
-        })
-        .collect();
-    rejected.par_sort_unstable();
-
-    rejected
-}
-
 fn event<'a>(
-    [id, user, time, ingest, kind, product, price]: [&'a [u8]; 7],
-    links: &LinkedIds<'a>,
+    [id, user, time, _, kind, product, price]: [&'a [u8]; 7],
+    links: &LinkedIds,
     products: &Products<'_>,
     identities: &People<'a>,
     window: &Range<i64>,
+    ingest: i64,
 ) -> Option<Event> {
     if id.is_empty() || user.is_empty() || product.is_empty() {
         return None;
     }
     let time = timestamp(time)?;
-    if !window.contains(&time) || timestamp(ingest)? - time > DAY {
+    if !window.contains(&time) || ingest - time > DAY {
         return None;
     }
     let (price, category) = match kind {
@@ -170,7 +127,7 @@ fn event<'a>(
         }
         _ => return None,
     };
-    let person = identities.key(links.person(user));
+    let person = links.person(identities.key(user));
     Some(Event {
         person,
         time,
@@ -181,28 +138,79 @@ fn event<'a>(
 
 pub fn events<'a>(
     input: &'a Input,
-    links: &LinkedIds<'a>,
+    links: &LinkedIds,
     products: &Products<'_>,
     identities: &People<'a>,
     window: Range<i64>,
     hashes: &RandomState,
+    repeats: &Repeats,
 ) -> [Vec<Event>; SHARDS] {
-    let rejected = duplicate_events(input, hashes);
     let people = Shards::new();
+    let candidates = Shards::new();
     input.chunks.par_iter().for_each_init(
-        || std::array::from_fn(|_| Vec::new()),
-        |local, chunk| {
-            let mut rejected = chunk.rejected(&rejected).iter().copied().peekable();
-            for (position, row) in input.rows(chunk) {
-                if rejected.next_if_eq(&position).is_some() {
+        || {
+            (
+                std::array::from_fn(|_| Vec::new()),
+                std::array::from_fn(|_| Vec::new()),
+            )
+        },
+        |(users, suspects), chunk| {
+            for row in input.rows(chunk) {
+                let Some(values) = fields::<7>(row) else {
+                    continue;
+                };
+                let [id, ..] = values;
+                if id.is_empty() {
                     continue;
                 }
-                let Some(values) = fields(row) else { continue };
-                if let Some(event) = event(values, links, products, identities, &window) {
-                    local[shard(hashes.hash_one(event.person))].push(event);
+                let hash = hashes.hash_one(id);
+                let ingest = ingest_millis(values[3]);
+                let event = event(values, links, products, identities, &window, ingest);
+                if repeats.might_repeat(hash) {
+                    let (key, long_id) = match inline_ascii(id) {
+                        Some(key) => (key, None),
+                        None => (hash, Some(id)),
+                    };
+                    suspects[shard(hash)].push(Candidate {
+                        key,
+                        long_id,
+                        priority: ingest,
+                        event,
+                    });
+                } else if let Some(event) = event {
+                    users[shard(hashes.hash_one(event.person))].push(event);
                 }
             }
-            people.append(local);
+            people.append(users);
+            candidates.append(suspects);
+        },
+    );
+
+    candidates.into_vecs().into_par_iter().for_each_init(
+        || std::array::from_fn(|_| Vec::new()),
+        |users, candidates| {
+            let mut unique = HashTable::<Candidate<'_>>::with_capacity(candidates.len());
+            for candidate in candidates {
+                match unique.entry(
+                    hashes.hash_one(candidate.key),
+                    |existing| {
+                        existing.key == candidate.key && existing.long_id == candidate.long_id
+                    },
+                    |existing| hashes.hash_one(existing.key),
+                ) {
+                    Entry::Vacant(slot) => {
+                        slot.insert(candidate);
+                    }
+                    Entry::Occupied(mut slot) if candidate.priority < slot.get().priority => {
+                        *slot.get_mut() = candidate;
+                    }
+                    Entry::Occupied(_) => {}
+                }
+            }
+            for winner in unique.into_iter().filter_map(|candidate| candidate.event) {
+                users[shard(hashes.hash_one(winner.person))].push(winner);
+            }
+            people.append(users);
         },
     );
     people.into_vecs()
@@ -210,7 +218,7 @@ pub fn events<'a>(
 
 pub fn clicks<'a>(
     input: &'a Input,
-    links: &LinkedIds<'a>,
+    links: &LinkedIds,
     campaigns: &Campaigns<'_>,
     identities: &People<'a>,
     window: Range<i64>,
@@ -222,7 +230,7 @@ pub fn clicks<'a>(
     input.chunks.par_iter().for_each_init(
         || std::array::from_fn(|_| Vec::new()),
         |local, chunk| {
-            for (_, row) in input.rows(chunk) {
+            for row in input.rows(chunk) {
                 let Some([id, user, campaign, time]) = fields(row) else {
                     continue;
                 };
@@ -235,7 +243,7 @@ pub fn clicks<'a>(
                 let Some(&campaign) = campaigns.codes.get(campaign) else {
                     continue;
                 };
-                let person = identities.key(links.person(user));
+                let person = links.person(identities.key(user));
                 local[shard(hashes.hash_one(person))].push(Click {
                     person,
                     time,
