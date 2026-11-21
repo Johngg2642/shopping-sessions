@@ -1,6 +1,6 @@
 #!/bin/sh
 # Run the image the way the scorer does: docker_run.sh DATA_DIR OUTPUT_DIR
-# Same flags as the scorer box, except the resource limits come from CPUS / MEM.
+# Set SHOPPING_CPUSET to pin the container to a chosen list of host CPUs.
 set -eu
 IMAGE="${IMAGE:-shopping-sessions:latest}"
 CPUS="${CPUS:-8}"
@@ -22,12 +22,16 @@ release() {
   rm -rf "$SCRATCH" 2>/dev/null || true
 }
 trap release EXIT
+set --
+if [ -n "${SHOPPING_CPUSET:-}" ]; then
+  set -- --cpuset-cpus "$SHOPPING_CPUSET"
+fi
 docker run --rm --platform "$PLATFORM" \
   --network none --read-only --tmpfs /tmp:rw,size=64m,mode=1777 \
   --cap-drop ALL --security-opt no-new-privileges \
-  --pids-limit 4096 --cpus "$CPUS" --memory "$MEM" --memory-swap "$MEM" \
+  --pids-limit 4096 --cpus "$CPUS" "$@" --memory "$MEM" --memory-swap "$MEM" \
   --user 1000:1000 \
   -v "$DATA":/data:ro,z -v "$OUT":/output:z -v "$SCRATCH":/scratch:z \
   -e DATA_DIR=/data -e OUTPUT_DIR=/output -e SCRATCH_DIR=/scratch -e HOME=/scratch \
-  -e NCPU="${CPUS%.*}" -e MEM_GB="${MEM%g}" -e PROFILE \
+  -e NCPU="${CPUS%.*}" -e MEM_GB="${MEM%g}" -e PROFILE -e CSV_SIMD \
   "$IMAGE"

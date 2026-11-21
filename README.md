@@ -38,7 +38,7 @@ Docker builds for `linux/amd64` by default. On Apple silicon, `PLATFORM=linux/ar
 
 1. Process newline-aligned chunks of memory-mapped files in parallel. A block scanner finds newlines, commas and quotes together. It uses AVX-512 byte comparisons when available and supports AVX2, NEON and scalar parsing. Only LF ends a row. Spaces and carriage returns remain in field values.
 2. Read each event CSV once while building linked components with union by size and path compression. Each component tracks its byte-wise minimum ID, including IDs absent from events and clicks. Event candidates retain their individual user IDs until the link graph is ready.
-3. Deduplicate the parsed events in memory. A direct index holds the first distinct event ID for each bucket, with an exact overflow table for other IDs that share the bucket. An invalid earliest event copy still suppresses later copies. Resolve the surviving event and click IDs to their canonical people. Typical event payloads use a window-relative timestamp and packed purchase fields. An overflow representation preserves wider timestamps and categories.
+3. Deduplicate event IDs in a compact direct index with an exact overflow table. Hash fingerprints avoid loading unrelated rows from occupied buckets. An invalid earliest event copy still suppresses later copies. Route the surviving events and valid clicks by canonical person. Typical event payloads use a window-relative timestamp and packed purchase fields. An overflow representation preserves wider timestamps and categories.
 4. Store canonical person IDs as 64-bit keys. Up to nine nonzero ASCII bytes fit inline, and other names use an exact dictionary. Sort each person shard in place and scan its events once to build sessions and daily category totals. Clicks use the same person keys. The click sort puts identical copies next to each other for deduplication and orders equal timestamps by descending click ID so the last eligible click has the smallest ID.
 5. Merge overlapping seven-day coverage intervals per campaign. Use binary searches on session starts to count each interval by UTC day. This bounds work when a shared device ties thousands of user IDs together and each campaign has many qualifying clicks.
 6. Write user-day output in parallel, reduce campaign totals across shards, and write the campaign-day table. A bounded dense array holds campaign totals for ordinary date windows and a sparse map handles wider ones. Both outputs use Parquet DATE columns and 64-bit counts and revenue.
@@ -56,3 +56,11 @@ PROFILE=1 NCPU=8 time target/release/shopping-sessions "$bench/data" "$bench/out
 ```
 
 For a final-size stress test, use seed 47 with 60M events and 15M clicks. Generated stress inputs have no published answers. Run the supplied exact comparisons on the fixtures and public dev input before using the stress inputs for performance measurements.
+
+On native amd64 Linux, choose eight available CPU IDs for `SHOPPING_CPUSET`. Use the same data and CPU set for both runs. The default scanner selects AVX-512 when the CPU supports it. `CSV_SIMD=avx2` forces AVX2 in the amd64 image.
+
+```sh
+make build
+time env PROFILE=1 SHOPPING_CPUSET=0-7 scripts/docker_run.sh "$bench/data" "$bench/auto"
+time env PROFILE=1 SHOPPING_CPUSET=0-7 CSV_SIMD=avx2 scripts/docker_run.sh "$bench/data" "$bench/avx2"
+```

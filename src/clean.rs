@@ -244,6 +244,11 @@ fn deduplicate<T>(
     // Only different IDs that land in an occupied bucket use the overflow table.
     // A primary bucket changes owners only to another copy of the same ID.
     let length = u32::try_from(rows.len()).expect("event shard row count");
+    if length < 2 {
+        return;
+    }
+    // Store the one-based index and use its spare bits for a hash fingerprint.
+    let index_mask = u32::MAX >> length.leading_zeros();
     let mut primary = vec![0u32; (rows.len() * 2).next_power_of_two()];
     let mask = primary.len() - 1;
     let mut overflow = HashTable::<u32>::with_capacity(rows.len() / 4);
@@ -262,15 +267,20 @@ fn deduplicate<T>(
         let a = &rows[current as usize];
         let id = key(a);
         let hash = hashes.hash_one(id);
+        let fingerprint = (hash >> 32) as u32 & !index_mask;
         let bucket = &mut primary[hash as usize & mask];
-        let Some(previous) = bucket.checked_sub(1) else {
-            *bucket = current + 1;
+        let entry = *bucket;
+        if entry == 0 {
+            *bucket = fingerprint | (current + 1);
             continue;
-        };
-        let b = &rows[previous as usize];
-        if key(b) == id && same(b, a) {
-            *bucket = winner(rows, current, previous) + 1;
-            continue;
+        }
+        if entry & !index_mask == fingerprint {
+            let previous = (entry & index_mask) - 1;
+            let b = &rows[previous as usize];
+            if key(b) == id && same(b, a) {
+                *bucket = fingerprint | (winner(rows, current, previous) + 1);
+                continue;
+            }
         }
 
         match overflow.entry(
@@ -441,5 +451,37 @@ mod tests {
             rows.map(|row| row.event.is_some()),
             [false, false, true, false, false]
         );
+    }
+
+    #[test]
+    fn long_ids_with_identical_fingerprints_stay_distinct() {
+        let people = People::default();
+        let event = Event {
+            person: people.key(b"user"),
+            payload: 17,
+        };
+        let candidate = |id, priority, event| LongCandidate {
+            id,
+            row: Candidate {
+                key: 1,
+                priority,
+                event,
+            },
+        };
+        let mut rows = [
+            candidate(b"first-long-id", 2, Some(event)),
+            candidate(b"other-long-id", 3, Some(event)),
+            candidate(b"first-long-id", 1, None),
+        ];
+        deduplicate(
+            &mut rows,
+            |row| row.row.key,
+            |a, b| a.id == b.id,
+            |row| &mut row.row,
+            &RandomState::with_seeds(1, 2, 3, 4),
+        );
+        assert!(rows[0].row.event.is_none());
+        assert!(rows[1].row.event.is_some());
+        assert!(rows[2].row.event.is_none());
     }
 }
