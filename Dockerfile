@@ -1,7 +1,7 @@
 # syntax=docker/dockerfile:1
 FROM rust:1.100-bookworm AS build
 ARG TARGETARCH
-ARG AMD64_TARGET_CPU=x86-64-v3
+ARG AMD64_TARGET_CPU=cascadelake
 WORKDIR /build
 COPY Cargo.toml Cargo.lock ./
 COPY src/ src/
