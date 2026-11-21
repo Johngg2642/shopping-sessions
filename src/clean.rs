@@ -1,5 +1,6 @@
 use std::ops::Range;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use ahash::RandomState;
 use hashbrown::HashTable;
@@ -8,11 +9,14 @@ use rayon::prelude::*;
 
 use crate::csv::records;
 use crate::dimensions::{Campaigns, LinkedIds, Products};
-use crate::input::{DAY, Input, decimal, ingest_millis, timestamp};
+use crate::input::{DAY, Input, decimal, ingest_seconds, timestamp};
 
 use crate::person::{People, PersonKey, inline_ascii};
 
 const SHARDS: usize = 128;
+const SHARD_BITS: u32 = SHARDS.trailing_zeros();
+const SLOT_BITS: u32 = 25;
+const SLOT_MASK: u64 = (1 << SLOT_BITS) - 1;
 
 const EXTENDED_EVENT: u64 = 255 << 56;
 
@@ -100,8 +104,50 @@ pub struct Click<'a> {
 
 struct Candidate {
     key: u64,
-    priority: i64,
-    event: Option<Event>,
+    row: InputRow,
+}
+
+#[derive(Clone, Copy)]
+struct InputRow {
+    chunk: u32,
+    index: u32,
+}
+
+#[derive(Clone, Copy)]
+struct RowData(u64);
+
+impl RowData {
+    fn new(ingest: i64, slot: usize) -> Self {
+        // Four-digit UTC years fit in signed 39-bit epoch seconds. The low
+        // 25 bits fit a partition and its local offset within an input chunk.
+        // A 2 MiB chunk has fewer than 80,000 records given the ingest field and
+        // separators, even if its last line extends past the chunk boundary.
+        // Slot zero keeps the ingest time of a row with no valid event payload.
+        debug_assert!((-(1i64 << 38)..1i64 << 38).contains(&ingest));
+        assert!(slot as u64 <= SLOT_MASK, "event slot within input chunk");
+        Self((ingest as u64) << SLOT_BITS | slot as u64)
+    }
+
+    fn priority(self) -> i64 {
+        (self.0 as i64) >> SLOT_BITS
+    }
+
+    fn reject(self, starts: &[usize; SHARDS], rejected: &[Vec<AtomicU64>; SHARDS]) {
+        let encoded_slot = (self.0 & SLOT_MASK) as usize;
+        if encoded_slot != 0 {
+            let slot = encoded_slot - 1;
+            let shard = slot & (SHARDS - 1);
+            let index = starts[shard] + (slot >> SHARD_BITS);
+            rejected[shard][index / 64].fetch_or(1 << (index % 64), Ordering::Relaxed);
+        }
+    }
+}
+
+struct InputChunkRows {
+    // Translate local row slots only for duplicate losers. The hot side index
+    // can retain a 16-byte key and row reference for common short IDs.
+    starts: [usize; SHARDS],
+    rows: Vec<RowData>,
 }
 
 struct LongCandidate<'a> {
@@ -110,6 +156,8 @@ struct LongCandidate<'a> {
 }
 
 pub struct EventCandidates<'a> {
+    events: [Vec<Event>; SHARDS],
+    chunks: Vec<InputChunkRows>,
     short: [Vec<Candidate>; SHARDS],
     long: [Vec<LongCandidate<'a>>; SHARDS],
 }
@@ -126,9 +174,19 @@ impl<T> Shards<T> {
     }
 
     fn append(&self, local: &mut [Vec<T>; SHARDS]) {
-        for (shared, rows) in self.0.iter().zip(local) {
+        self.append_with_starts(local, |_, _| {});
+    }
+
+    fn append_with_starts(
+        &self,
+        local: &mut [Vec<T>; SHARDS],
+        mut start: impl FnMut(usize, usize),
+    ) {
+        for (shard, (shared, rows)) in self.0.iter().zip(local).enumerate() {
             if !rows.is_empty() {
-                shared.lock().expect("shard lock").append(rows);
+                let mut shared = shared.lock().expect("shard lock");
+                start(shard, shared.len());
+                shared.append(rows);
             }
         }
     }
@@ -155,7 +213,7 @@ fn event<'a>(
         return None;
     }
     let time = timestamp(time)?;
-    if !window.contains(&time) || ingest - time > DAY {
+    if !window.contains(&time) || ingest * 1_000 - DAY > time {
         return None;
     }
     let (price, category) = match kind {
@@ -184,60 +242,83 @@ pub fn event_candidates<'a>(
     input: &'a Input,
     products: &Products<'_>,
     identities: &People<'a>,
+    links: &LinkedIds,
     window: Range<i64>,
     hashes: &RandomState,
     encoder: &EventEncoder,
 ) -> EventCandidates<'a> {
-    let short = Shards::with_capacity(input.bytes() / 65);
+    let rows = input.bytes() / 65;
+    let people = Shards::with_capacity(rows);
+    let short = Shards::with_capacity(rows);
     let long = Shards::with_capacity(0);
-    input.chunks.par_iter().for_each_init(
-        || {
-            (
-                std::array::from_fn(|_| Vec::new()),
-                std::array::from_fn(|_| Vec::new()),
-            )
-        },
-        |(short_local, long_local), chunk| {
-            records::<7>(input.chunk_bytes(chunk), |values| {
-                let id = values[0];
-                if id.is_empty() {
-                    return;
-                }
-                let priority = ingest_millis(values[3]);
-                let event = event(values, products, identities, &window, priority, encoder);
-                if let Some(key) = inline_ascii(id) {
-                    short_local[shard(hashes.hash_one(key))].push(Candidate {
-                        key,
-                        priority,
-                        event,
-                    });
-                } else {
-                    let key = hashes.hash_one(id);
-                    long_local[shard(key)].push(LongCandidate {
-                        id,
-                        row: Candidate {
-                            key,
-                            priority,
-                            event,
-                        },
-                    });
-                }
-            });
-            short.append(short_local);
-            long.append(long_local);
-        },
-    );
+    let chunks = input
+        .chunks
+        .par_iter()
+        .enumerate()
+        .map_init(
+            || {
+                (
+                    std::array::from_fn(|_| Vec::new()),
+                    std::array::from_fn(|_| Vec::new()),
+                    std::array::from_fn(|_| Vec::new()),
+                )
+            },
+            |(short_local, long_local, person_local), (chunk_id, chunk)| {
+                let chunk_id = u32::try_from(chunk_id).expect("input chunk index");
+                let bytes = input.chunk_bytes(chunk);
+                let mut rows = Vec::with_capacity(bytes.len() / 75);
+                records::<7>(bytes, |values| {
+                    let id = values[0];
+                    if id.is_empty() {
+                        return;
+                    }
+                    let ingest = ingest_seconds(values[3]);
+                    let slot = event(values, products, identities, &window, ingest, encoder)
+                        .map_or(0, |mut event| {
+                            event.person = links.person(event.person);
+                            let partition = shard(hashes.hash_one(event.person));
+                            let events = &mut person_local[partition];
+                            let slot = events.len() * SHARDS + partition + 1;
+                            events.push(event);
+                            slot
+                        });
+                    let row = InputRow {
+                        chunk: chunk_id,
+                        index: u32::try_from(rows.len()).expect("input row index"),
+                    };
+                    rows.push(RowData::new(ingest, slot));
+                    if let Some(key) = inline_ascii(id) {
+                        short_local[shard(hashes.hash_one(key))].push(Candidate { key, row });
+                    } else {
+                        let key = hashes.hash_one(id);
+                        long_local[shard(key)].push(LongCandidate {
+                            id,
+                            row: Candidate { key, row },
+                        });
+                    }
+                });
+                let mut starts = [0; SHARDS];
+                people.append_with_starts(person_local, |shard, start| starts[shard] = start);
+                short.append(short_local);
+                long.append(long_local);
+                InputChunkRows { starts, rows }
+            },
+        )
+        .collect();
     EventCandidates {
+        events: people.into_vecs(),
+        chunks,
         short: short.into_vecs(),
         long: long.into_vecs(),
     }
 }
 
 fn deduplicate<T>(
-    rows: &mut [T],
-    key: impl Fn(&T) -> u64,
+    rows: &[T],
+    candidate: impl Fn(&T) -> &Candidate,
     same: impl Fn(&T, &T) -> bool,
-    get: impl Fn(&mut T) -> &mut Candidate,
+    chunks: &[InputChunkRows],
+    rejected: &[Vec<AtomicU64>; SHARDS],
     hashes: &RandomState,
 ) {
     // Keep the first distinct ID for each bucket in a compact direct index.
@@ -252,20 +333,26 @@ fn deduplicate<T>(
     let mut primary = vec![0u32; (rows.len() * 2).next_power_of_two()];
     let mask = primary.len() - 1;
     let mut overflow = HashTable::<u32>::with_capacity(rows.len() / 4);
-    let winner = |rows: &mut [T], a: u32, b: u32| {
-        let rank = get(&mut rows[a as usize]).priority;
-        let (keep, discard) = if rank < get(&mut rows[b as usize]).priority {
-            (a, b)
+    let lookup = |index: u32| {
+        let row = candidate(&rows[index as usize]).row;
+        let chunk = &chunks[row.chunk as usize];
+        (&chunk.starts, chunk.rows[row.index as usize])
+    };
+    let winner = |a: u32, b: u32| {
+        let (starts_a, first) = lookup(a);
+        let (starts_b, second) = lookup(b);
+        if first.priority() < second.priority() {
+            second.reject(starts_b, rejected);
+            a
         } else {
-            (b, a)
-        };
-        get(&mut rows[discard as usize]).event = None;
-        keep
+            first.reject(starts_a, rejected);
+            b
+        }
     };
 
     for current in 0..length {
         let a = &rows[current as usize];
-        let id = key(a);
+        let id = candidate(a).key;
         let hash = hashes.hash_one(id);
         let fingerprint = (hash >> 32) as u32 & !index_mask;
         let bucket = &mut primary[hash as usize & mask];
@@ -277,55 +364,73 @@ fn deduplicate<T>(
         if entry & !index_mask == fingerprint {
             let previous = (entry & index_mask) - 1;
             let b = &rows[previous as usize];
-            if key(b) == id && same(b, a) {
-                *bucket = fingerprint | (winner(rows, current, previous) + 1);
+            if candidate(b).key == id && same(b, a) {
+                *bucket = fingerprint | (winner(current, previous) + 1);
                 continue;
             }
         }
 
         match overflow.entry(
             hash,
-            |&existing| key(&rows[existing as usize]) == id && same(&rows[existing as usize], a),
-            |&existing| hashes.hash_one(key(&rows[existing as usize])),
+            |&existing| {
+                candidate(&rows[existing as usize]).key == id && same(&rows[existing as usize], a)
+            },
+            |&existing| hashes.hash_one(candidate(&rows[existing as usize]).key),
         ) {
             Entry::Vacant(slot) => {
                 slot.insert(current);
             }
             Entry::Occupied(mut slot) => {
-                *slot.get_mut() = winner(rows, current, *slot.get());
+                *slot.get_mut() = winner(current, *slot.get());
             }
         }
     }
 }
 
 impl EventCandidates<'_> {
-    pub fn into_events(self, links: &LinkedIds, hashes: &RandomState) -> [Vec<Event>; SHARDS] {
-        let rows = self.short.iter().map(Vec::len).sum::<usize>()
-            + self.long.iter().map(Vec::len).sum::<usize>();
-        let people = Shards::with_capacity(rows + rows / 16);
-        self.short.into_par_iter().zip(self.long).for_each_init(
-            || std::array::from_fn(|_| Vec::new()),
-            |local, (mut short, mut long)| {
-                deduplicate(&mut short, |row| row.key, |_, _| true, |row| row, hashes);
-                deduplicate(
-                    &mut long,
-                    |row| row.row.key,
-                    |a, b| a.id == b.id,
-                    |row| &mut row.row,
-                    hashes,
-                );
-                let events = short
-                    .into_iter()
-                    .filter_map(|row| row.event)
-                    .chain(long.into_iter().filter_map(|row| row.row.event));
-                for mut event in events {
-                    event.person = links.person(event.person);
-                    local[shard(hashes.hash_one(event.person))].push(event);
-                }
-                people.append(local);
-            },
-        );
-        people.into_vecs()
+    pub fn into_events(self, hashes: &RandomState) -> [Vec<Event>; SHARDS] {
+        let Self {
+            mut events,
+            chunks,
+            short,
+            long,
+        } = self;
+        let rejected = std::array::from_fn(|shard| {
+            (0..events[shard].len().div_ceil(64))
+                .map(|_| AtomicU64::new(0))
+                .collect()
+        });
+        short.into_par_iter().zip(long).for_each(|(short, long)| {
+            deduplicate(&short, |row| row, |_, _| true, &chunks, &rejected, hashes);
+            deduplicate(
+                &long,
+                |row| &row.row,
+                |a, b| a.id == b.id,
+                &chunks,
+                &rejected,
+                hashes,
+            );
+        });
+        events
+            .par_iter_mut()
+            .zip(rejected)
+            .for_each(|(events, bits)| {
+                remove_rejected(events, bits);
+            });
+        events
+    }
+}
+
+fn remove_rejected(events: &mut Vec<Event>, rejected: Vec<AtomicU64>) {
+    // Work backward so swapping in the last survivor cannot move a row that
+    // still needs to be discarded. Aggregation sorts these partitions later.
+    for (word, mask) in rejected.into_iter().enumerate().rev() {
+        let mut mask = mask.into_inner();
+        while mask != 0 {
+            let bit = (u64::BITS - 1) - mask.leading_zeros();
+            events.swap_remove(word * 64 + bit as usize);
+            mask ^= 1 << bit;
+        }
     }
 }
 
@@ -419,69 +524,96 @@ mod tests {
     }
 
     #[test]
-    fn colliding_ids_choose_their_own_earliest_copy() {
+    fn colliding_ids_choose_their_own_earliest_copy_across_person_partitions() {
         let hashes = RandomState::with_seeds(1, 2, 3, 4);
         let key_a = 1u64;
         let key_b = (2u64..)
             .find(|&key| hashes.hash_one(key) & 15 == hashes.hash_one(key_a) & 15)
             .expect("colliding key");
-        let people = People::default();
-        let event = EventEncoder::new(0).pack(
-            people.key(b"user"),
-            EventDetails {
-                time: 17,
-                price: 0,
-                category: 0,
-            },
-        );
-        let mut rows = [
-            (key_a, 3, Some(event)),
-            (key_b, 4, Some(event)),
-            (key_a, 2, Some(event)),
-            (key_b, 1, None),
-            (key_b, 5, Some(event)),
+        let rows = [
+            (key_a, 0, 0),
+            (key_b, 0, 1),
+            (key_a, 1, 0),
+            (key_b, 0, 2),
+            (key_b, 1, 1),
         ]
-        .map(|(key, priority, event)| Candidate {
+        .map(|(key, chunk, index)| Candidate {
             key,
-            priority,
-            event,
+            row: InputRow { chunk, index },
         });
-        deduplicate(&mut rows, |row| row.key, |_, _| true, |row| row, &hashes);
-        assert_eq!(
-            rows.map(|row| row.event.is_some()),
-            [false, false, true, false, false]
-        );
+        let mut starts = [0; SHARDS];
+        starts[1] = 64;
+        let chunks = [
+            InputChunkRows {
+                starts: [0; SHARDS],
+                rows: vec![RowData::new(3, 1), RowData::new(4, 2), RowData::new(1, 0)],
+            },
+            InputChunkRows {
+                starts,
+                rows: vec![RowData::new(2, 3), RowData::new(5, 2)],
+            },
+        ];
+        let rejected = std::array::from_fn(|_| vec![AtomicU64::new(0), AtomicU64::new(0)]);
+        deduplicate(&rows, |row| row, |_, _| true, &chunks, &rejected, &hashes);
+        assert_eq!(rejected[0][0].load(Ordering::Relaxed), 1);
+        assert_eq!(rejected[1][0].load(Ordering::Relaxed), 1);
+        assert_eq!(rejected[1][1].load(Ordering::Relaxed), 1);
+        assert_eq!(rejected[2][0].load(Ordering::Relaxed), 0);
     }
 
     #[test]
     fn long_ids_with_identical_fingerprints_stay_distinct() {
-        let people = People::default();
-        let event = Event {
-            person: people.key(b"user"),
-            payload: 17,
-        };
-        let candidate = |id, priority, event| LongCandidate {
+        let candidate = |id, index| LongCandidate {
             id,
             row: Candidate {
                 key: 1,
-                priority,
-                event,
+                row: InputRow { chunk: 0, index },
             },
         };
-        let mut rows = [
-            candidate(b"first-long-id", 2, Some(event)),
-            candidate(b"other-long-id", 3, Some(event)),
-            candidate(b"first-long-id", 1, None),
+        let rows = [
+            candidate(b"first-long-id", 0),
+            candidate(b"other-long-id", 1),
+            candidate(b"first-long-id", 2),
         ];
+        let chunks = [InputChunkRows {
+            starts: [0; SHARDS],
+            rows: vec![
+                RowData::new(2, 1),
+                RowData::new(3, SHARDS + 1),
+                RowData::new(-1, 0),
+            ],
+        }];
+        let rejected = std::array::from_fn(|_| vec![AtomicU64::new(0)]);
         deduplicate(
-            &mut rows,
-            |row| row.row.key,
+            &rows,
+            |row| &row.row,
             |a, b| a.id == b.id,
-            |row| &mut row.row,
+            &chunks,
+            &rejected,
             &RandomState::with_seeds(1, 2, 3, 4),
         );
-        assert!(rows[0].row.event.is_none());
-        assert!(rows[1].row.event.is_some());
-        assert!(rows[2].row.event.is_none());
+        assert_eq!(rejected[0][0].load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn removes_rejected_rows_across_bitmap_words_in_place() {
+        let people = People::default();
+        let person = people.key(b"user");
+        let mut events: Vec<_> = (0..130).map(|payload| Event { person, payload }).collect();
+        remove_rejected(
+            &mut events,
+            vec![
+                AtomicU64::new(1 | 1 << 63),
+                AtomicU64::new(1),
+                AtomicU64::new(2),
+            ],
+        );
+        events.sort_unstable_by_key(|event| event.payload);
+        assert!(
+            events
+                .into_iter()
+                .map(|event| event.payload)
+                .eq((1..63).chain(65..129))
+        );
     }
 }
