@@ -1,23 +1,21 @@
-# Shopping Sessions starter: Polars skeleton.
-# The scorers are linux/amd64 (Intel Xeon). They build this file natively, so
-# no FROM line pins a platform: `make build` builds for linux/amd64 anywhere.
-FROM python:3.12-slim-bookworm
+# syntax=docker/dockerfile:1
+FROM rust:1.100-bookworm AS build
+ARG TARGETARCH
+WORKDIR /build
+COPY Cargo.toml Cargo.lock ./
+COPY src/ src/
+RUN --mount=type=cache,id=shopping-registry-${TARGETARCH},target=/usr/local/cargo/registry \
+    --mount=type=cache,id=shopping-target-${TARGETARCH},target=/build/target \
+    if [ "$TARGETARCH" = amd64 ]; then \
+        export CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS="-C target-cpu=x86-64-v3"; \
+        cargo build --release --locked --target x86_64-unknown-linux-gnu && \
+        cp target/x86_64-unknown-linux-gnu/release/shopping-sessions /shopping-sessions; \
+    else \
+        cargo build --release --locked && cp target/release/shopping-sessions /shopping-sessions; \
+    fi
 
-# The scorer runs the container as uid 1000; give that uid a name and a home.
-RUN useradd --uid 1000 --no-create-home --home-dir /scratch app
-
-COPY requirements.txt /app/requirements.txt
-RUN pip install --no-cache-dir -r /app/requirements.txt
-
-COPY pipeline/ /app/pipeline/
-COPY run.sh /app/run.sh
-RUN chmod +x /app/run.sh
-
-# At run time the root filesystem is read-only, the user is 1000:1000, there is
-# no network, /data is read-only, and /output and /scratch are the only writable
-# places. run.sh points every temp and cache directory at /scratch.
-ENV PYTHONDONTWRITEBYTECODE=1 \
-    PYTHONUNBUFFERED=1
-
-WORKDIR /app
-CMD ["/app/run.sh"]
+FROM debian:bookworm-slim
+COPY --from=build /shopping-sessions /usr/local/bin/shopping-sessions
+ENV DATA_DIR=/data OUTPUT_DIR=/output SCRATCH_DIR=/scratch HOME=/scratch TMPDIR=/scratch
+USER 1000:1000
+ENTRYPOINT ["/usr/local/bin/shopping-sessions"]

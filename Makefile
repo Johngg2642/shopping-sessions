@@ -4,11 +4,12 @@ MEM   ?= 24g
 # The scorer's platform. PLATFORM=linux/arm64 builds and runs natively on an Apple-silicon Mac, for fast local loops.
 PLATFORM ?= linux/amd64
 DEV   ?= dev
-# In the monorepo the fixtures live two levels up; the published starter has its own copy.
-FIXTURES ?= $(if $(wildcard fixtures),fixtures,../../fixtures)
+FIXTURES ?= fixtures
+PYTHON ?= python3
+CARGO ?= cargo
 export IMAGE CPUS MEM PLATFORM
 
-.PHONY: build fixtures dev run-dev check-dev
+.PHONY: build fixtures fixtures-native dev run-dev check-dev
 
 ## Build the image for the scorer's platform, linux/amd64 (emulated on Apple silicon)
 build:
@@ -16,7 +17,11 @@ build:
 
 ## Run the image on all 36 edge-case fixtures and diff against the expected tables
 fixtures: build
-	python3 scripts/run_fixtures.py $(FIXTURES) -- scripts/docker_run.sh
+	$(PYTHON) scripts/run_fixtures.py $(FIXTURES) -- scripts/docker_run.sh
+
+fixtures-native:
+	$(CARGO) build --release --locked
+	NCPU=$(CPUS) $(PYTHON) scripts/run_fixtures.py $(FIXTURES) -- target/release/shopping-sessions
 
 ## Make the 1M-event dev set with the published generator (needs `generate` on PATH)
 dev:
@@ -29,4 +34,4 @@ run-dev: build
 ## Compare your dev output with the published dev answer (dev-answer.zip, unzipped): make check-dev ANSWER=dev-answer
 ANSWER ?= dev-answer
 check-dev:
-	python3 scripts/compare.py out $(ANSWER)
+	$(PYTHON) scripts/compare.py out $(ANSWER)
