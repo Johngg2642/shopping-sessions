@@ -1,0 +1,12 @@
+/*.zip
+/dev/
+/dev-answer/
+/data/
+/out/
+/output/
+/scratch/
+/generator/
+/target/
+/.venv/
+__pycache__/
+.DS_Store

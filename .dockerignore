@@ -1,0 +1,13 @@
+fixtures/
+dev/
+dev-answer/
+data/
+out/
+output/
+scratch/
+generator/
+target/
+.venv/
+*.zip
+*.md
+.git
