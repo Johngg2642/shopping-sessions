@@ -22,6 +22,38 @@ def docker(*args):
     return subprocess.check_output(["docker", *args], text=True).strip()
 
 
+def report_cpu(image, cpuset):
+    try:
+        cpuinfo = docker(
+            "run", "--rm", "--platform", "linux/amd64", "--network", "none",
+            "--cpuset-cpus", cpuset, "--entrypoint", "/bin/cat", image, "/proc/cpuinfo",
+        )
+    except subprocess.CalledProcessError:
+        print(f"CPU set {cpuset} | CPU model unavailable", flush=True)
+        return
+    ids = set()
+    for part in cpuset.split(","):
+        first, _, last = part.partition("-")
+        ids.update(range(int(first), int(last or first) + 1))
+    models = set()
+    flags = {"aes", "avx2", "bmi2", "avx512f", "avx512bw", "avx512vl", "avx512_vnni", "avx512vbmi2"}
+    for block in cpuinfo.split("\n\n"):
+        fields = {}
+        for line in block.splitlines():
+            key, separator, value = line.partition(":")
+            if separator:
+                fields[key.strip()] = value.strip()
+        if int(fields.get("processor", "-1")) in ids:
+            models.add(fields.get("model name", "unknown"))
+            flags.intersection_update(fields.get("flags", "").split())
+    if models:
+        names = ", ".join(sorted(models))
+        common_flags = " ".join(sorted(flags)) or "none reported"
+        print(f"CPU set {cpuset} | {names} | common instruction flags {common_flags}", flush=True)
+    else:
+        print(f"CPU set {cpuset} | CPU model unavailable", flush=True)
+
+
 def header_only(source, destination):
     destination.mkdir()
     shutil.copyfile(source / "manifest.json", destination / "manifest.json")
@@ -34,13 +66,14 @@ def header_only(source, destination):
             stripped.write_bytes(stream.readline())
 
 
-def sample(image, phase, data, directory, args):
+def sample(image, simd, phase, data, directory, args):
     for name in ("output", "scratch"):
         path = directory / name
         path.mkdir(parents=True)
         path.chmod(0o777)
 
     # Keep the limits and mounts in sync with scripts/docker_run.sh.
+    simd_env = f"CSV_SIMD={simd}" if simd else "CSV_SIMD"
     flags = [
         "--platform", "linux/amd64", "--network", "none", "--read-only",
         "--tmpfs", "/tmp:rw,size=64m,mode=1777", "--cap-drop", "ALL",
@@ -50,7 +83,7 @@ def sample(image, phase, data, directory, args):
         "-v", f"{data}:/data:ro,z", "-v", f"{directory / 'output'}:/output:z",
         "-v", f"{directory / 'scratch'}:/scratch:z",
         "-e", f"NCPU={args.cpus}", "-e", f"MEM_GB={args.memory.removesuffix('g')}",
-        "-e", "PROFILE", "-e", "CSV_SIMD",
+        "-e", "PROFILE", "-e", simd_env,
     ]
     if phase == "parse":
         flags += ["--entrypoint", "/usr/local/bin/phase-probe"]
@@ -84,7 +117,14 @@ def clear(directory, image):
 
 
 def benchmark(args):
-    samples = {(image, phase): [] for image in args.image for phase in PHASES}
+    report_cpu(args.image[0], args.cpuset)
+    simd_modes = ("auto", "avx2") if args.compare_simd else (None,)
+    samples = {
+        (image, simd, phase): []
+        for image in args.image
+        for simd in simd_modes
+        for phase in PHASES
+    }
     with tempfile.TemporaryDirectory(prefix="shopping-benchmark-") as temp:
         root = Path(temp)
         empty = root / "headers"
@@ -93,29 +133,35 @@ def benchmark(args):
             order = list(samples)
             if round_number % 2 == 0:
                 order.reverse()
-            for image, phase in order:
+            for image, simd, phase in order:
                 data = empty if phase == "startup" else args.data
                 directory = Path(tempfile.mkdtemp(dir=root))
                 directory.chmod(0o755)
                 try:
-                    wall, engine, log = sample(image, phase, data, directory, args)
+                    wall, engine, log = sample(image, simd, phase, data, directory, args)
                 finally:
                     clear(directory, image)
                 label = f"round {round_number}" if round_number else "warmup"
-                print(f"{label} {image} {phase} wall={wall:.6f}s engine={engine:.6f}s", flush=True)
+                build = f"{image}/{simd}" if simd else image
+                print(f"{label} {build} {phase} wall={wall:.6f}s engine={engine:.6f}s", flush=True)
                 if log:
                     print(log, flush=True)
                 if round_number:
-                    samples[image, phase].append((wall, engine))
-    for (image, phase), timings in samples.items():
+                    samples[image, simd, phase].append((wall, engine))
+    for (image, simd, phase), timings in samples.items():
+        build = f"{image}/{simd}" if simd else image
         wall, engine = map(median, zip(*timings))
-        print(f"median {image} {phase} wall={wall:.6f}s engine={engine:.6f}s")
+        print(f"median {build} {phase} wall={wall:.6f}s engine={engine:.6f}s")
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("data", type=Path)
     parser.add_argument("--image", action="append", help="benchmark image tag, repeat for comparisons")
+    parser.add_argument(
+        "--compare-simd", action="store_true",
+        help="alternate automatic and AVX2 scanning in the default x86-64-v3 image",
+    )
     parser.add_argument("--rounds", type=int, default=5)
     parser.add_argument("--cpus", type=int, default=8)
     parser.add_argument("--cpuset", default=os.environ.get("SHOPPING_CPUSET"))

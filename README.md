@@ -57,7 +57,7 @@ PROFILE=1 NCPU=8 time target/release/shopping-sessions "$bench/data" "$bench/out
 
 For a final-size stress test, use seed 47 with 60M events and 15M clicks. Generated stress inputs have no published answers. Run the supplied exact comparisons on the fixtures and public dev input before using the stress inputs for performance measurements.
 
-On native amd64 Linux, choose eight available CPU IDs for `SHOPPING_CPUSET`. Use the same data and CPU set for both runs. The default scanner selects AVX-512 when the CPU supports it. `CSV_SIMD=avx2` forces AVX2 in the amd64 image.
+On native amd64 Linux, choose eight available CPU IDs for `SHOPPING_CPUSET`. Use the same data and CPU set for both runs. The default scanner selects AVX-512 when the CPU supports it. Use the default x86-64-v3 image with `CSV_SIMD=avx2` to isolate the AVX2 scanner.
 
 ```sh
 make build
@@ -73,3 +73,15 @@ PROFILE=1 python3 scripts/benchmark_linux.py "$bench/data" --cpuset 0-7
 ```
 
 The startup run uses the production binary on header-only inputs and writes empty tables. The parser run decodes event and click CSV rows and timestamps from the full input. The full run writes both tables as usual. Each phase reports Docker create-to-exit wall time and the daemon's start-to-finish time, with one warm-up round excluded from the medians.
+
+The original organizer starter describes Intel Xeon Cascade Lake or newer. The live rules specify eight pinned hardware threads and 24 GB without naming an exact CPU. The benchmark prints the CPU model and common instruction flags for the selected logical CPUs inside Docker. Use an Intel host with Cascade Lake or newer features for the specialized build. [Starter README](https://github.com/Johngg2642/shopping-sessions/blob/b40a68cebdea7b12867c493c3326bc210e6a8ff5/README.md#container-limits) · [Track rules](https://www.joinbuilders.org/buildathon/tracks/shopping-sessions)
+
+```sh
+docker buildx build --platform linux/amd64 --target benchmark --load -t shopping-sessions:baseline .
+docker buildx build --platform linux/amd64 --target benchmark --load \
+  --build-arg AMD64_TARGET_CPU=cascadelake -t shopping-sessions:cascadelake .
+PROFILE=1 python3 scripts/benchmark_linux.py "$bench/data" --cpuset 0-7 \
+  --image shopping-sessions:baseline --image shopping-sessions:cascadelake
+```
+
+Use `--image shopping-sessions:baseline --compare-simd` to alternate AVX2 and automatic scanner selection in a single run. A Cascade Lake build can emit AVX-512 instructions even in the AVX2 source path, so use the baseline build for the SIMD-width comparison.
